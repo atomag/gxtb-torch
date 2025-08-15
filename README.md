@@ -10,7 +10,6 @@ For an ASE interface see `src/gxtb/ase_calc.py` (`GxTBCalculator`).
 
 
 ## Implementation Status
-The table below reflects the current implementation against the equations/sections in `doc/theory`. “Done” means implemented and wired; “Partial” means present but incomplete or pending validation; “Todo” is not implemented. PBC status is summarized at the end.
 
 | Area | Theory ref | Module(s) | Status | Notes |
 |---|---|---|---|---|
