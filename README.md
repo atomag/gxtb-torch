@@ -5,12 +5,12 @@ This repository is a Python implementation of g‑xTB accelerated by PyTorch. Th
 - https://chemrxiv.org/engage/chemrxiv/article-details/685434533ba0887c335fc974
 
 This is a preliminary version of g‑xTB, a general‑purpose semiempirical quantum mechanical method approximating ωB97M‑V/def2‑TZVPPD properties.
+🚧 Dispersion(revD4) is NOT working, I implemented an algro yields indentical results as tad-dftbd4 but cannot get PBC working for now.
 
 For an ASE interface see `src/gxtb/ase_calc.py` (`GxTBCalculator`).
 
 
 ## Implementation Status
-The table below reflects the current implementation against the equations/sections in `doc/theory`. “Done” means implemented and wired; “Partial” means present but incomplete or pending validation; “Todo” is not implemented. PBC status is summarized at the end.
 
 | Area | Theory ref | Module(s) | Status | Notes |
 |---|---|---|---|---|
