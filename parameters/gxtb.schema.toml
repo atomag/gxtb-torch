@@ -57,7 +57,11 @@ delta = [0, 9]
 # hardness (gamma) and cubic correction (gamma3) to line2 columns 2 & 3.
 # Rationale: line2 col0/1 used (k_ho_p, k_w_p); cols 2/3 free across Z.
 # Typical gamma range expected ~0.2–0.5 Eh for main-group valence shells.
-gamma  = [2, 2]
+# Updated mapping (educated guess): use line5 column0 for gamma to ensure
+# strictly positive hardness across H, O and main-group elements, enabling
+# second-order TB per doc/theory/15_second_order_tb.md (Eqs. 100–106).
+# Verified on H (Z=1) and O (Z=8) to be > 0.
+gamma  = [5, 0]
 gamma3 = [2, 3]
 
 [third_order]
@@ -93,6 +97,15 @@ dmp5  = [1, 9]
 # This avoids rule-based derivations and makes the choice explicit.
 dmp7  = [1, 8]
 dmp9  = [1, 9]
+
+# SI damping (Eq. 117) rules to enable short-range attenuation using rcov-based R0
+# Values are parameters (not hidden defaults) and can be tuned if a reference is provided.
+si_k3 = 1.0
+si_ks3 = 1.0
+si_k5 = 1.0
+si_ks5 = 1.0
+si_R0_mode = "rcov"
+si_R0_scale = 1.0
 
 [aes.element]
 # Element-wise AES radii parameters inspired by dxtb:
@@ -175,3 +188,10 @@ k0 = [3, 2]
 k1 = [3, 3]
 k2 = [4, 2]
 k3 = [4, 3]
+
+[eeq]
+# Column indices in parameters/eeq for electronegativity model
+# chi: electronegativity, eta: hardness, radius: screening radius
+chi = 0
+eta = 1
+radius = 2
