@@ -96,7 +96,8 @@ def eht_lattice_blocks(
 
     # Lattice translations within cutoff (include origin)
     translations: List[Tuple[int, int, int]] = build_lattice_translations(float(cutoff), cell)
-    S_blocks: List[torch.Tensor] = []
+    S_blocks_raw: List[torch.Tensor] = []
+    S_blocks_scaled: List[torch.Tensor] = []
     H_blocks: List[torch.Tensor] = []
 
     # Precompute shell eps averages used for off-diagonal blocks
@@ -108,7 +109,8 @@ def eht_lattice_blocks(
     for (ti, tj, tk) in translations:
         R = ti * cell[0] + tj * cell[1] + tk * cell[2]
         # Initialize blocks for this translation
-        S_R = torch.zeros((nao, nao), dtype=dtype, device=device)
+        S_R_raw = torch.zeros((nao, nao), dtype=dtype, device=device)
+        S_R_scaled = torch.zeros((nao, nao), dtype=dtype, device=device)
         H_R = torch.zeros((nao, nao), dtype=dtype, device=device)
 
         # For origin translation, include onsite diagonal eps on H
@@ -132,15 +134,22 @@ def eht_lattice_blocks(
                 dR = (positions[B] + R) - positions[A]
                 # Identify origin translation
                 is_origin = (ti == 0 and tj == 0 and tk == 0)
-                # Unscaled overlap block for this pair across cells
+                # Unscaled overlap block for this pair across cells (raw MD)
                 li = {'s':0,'p':1,'d':2,'f':3}[lA]
                 lj = {'s':0,'p':1,'d':2,'f':3}[lB]
                 block = overlap_shell_pair(li, lj, ai, ci, aj, cj, dR)
-                # Diatomic scaling (Eqs. 31–32)
-                kA_ch = k_channels_for_Z(ZA)
-                kB_ch = k_channels_for_Z(ZB)
-                Ssc = scale_diatomic_overlap(block, dR, lA, lB, kA_ch, kB_ch)
-                S_R[oi:oi+ni, oj:oj+nj] = Ssc
+                # Diatomic scaling (Eqs. 31–32) for off-center pairs only.
+                # For on-center origin pairs (A==B and R==0), keep raw block to preserve on-center normalization.
+                if is_origin and A == B:
+                    S_raw = block
+                    Ssc = block
+                else:
+                    kA_ch = k_channels_for_Z(ZA)
+                    kB_ch = k_channels_for_Z(ZB)
+                    S_raw = block
+                    Ssc = scale_diatomic_overlap(block, dR, lA, lB, kA_ch, kB_ch)
+                S_R_raw[oi:oi+ni, oj:oj+nj] = S_raw
+                S_R_scaled[oi:oi+ni, oj:oj+nj] = Ssc
                 # EHT off-diagonal H via modified Eq. 64 (skip on-site diagonal; already covered by eps_ao)
                 if is_origin and A == B and i == j:
                     pass
@@ -157,10 +166,11 @@ def eht_lattice_blocks(
                     H_R[oi:oi+ni, oj:oj+nj] = Hblk
 
         # Symmetrize within block (explicitly real)
-        S_blocks.append(0.5 * (S_R + S_R.T))
-        H_blocks.append(0.5 * (H_R + H_R.T))
+        S_blocks_raw.append(S_R_raw)
+        S_blocks_scaled.append(S_R_scaled)
+        H_blocks.append(H_R)
 
-    return {"translations": translations, "S_blocks": S_blocks, "H_blocks": H_blocks}
+    return {"translations": translations, "S_blocks_raw": S_blocks_raw, "S_blocks_scaled": S_blocks_scaled, "H_blocks": H_blocks}
 
 
 def assemble_k_matrices(

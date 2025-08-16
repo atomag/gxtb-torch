@@ -207,11 +207,17 @@ def compute_gamma2_shell(
     device=None,
     dtype=None,
 ) -> Tensor:
-    """Compute shell-resolved γ^{(2)} (Eq. 101) with Klopman-Ohno + exponential damping.
+    """Compute shell-resolved γ^{(2)} per doc/theory/15 (Eqs. 101–106).
 
-    γ_{i j} = 1 / ( R_AB + 0.5*(1/U_i + 1/U_j) ) * exp( -kexp * R_AB )
-    where shell i on atom A, shell j on atom B.
-    On-site (A=B,i=j) gives γ_{ii} = U_i (limit R_AB→0).
+    Form and units (atomic units clarity):
+      - Distances enter as bohr (a0). In a.u., Coulomb kernel 1/R has energy units (Eh).
+      - On-site limit must satisfy γ_{ii}(R→0) = U_i (Hubbard hardness for shell i on atom A).
+      - We use an Ohno-like regularization that recovers Coulomb at long range and the
+        correct onsite limit:
+            γ_{ij}(R) = 1 / sqrt( R^2 + ((a_i + a_j)/2)^2 ),
+        with a_i = 1 / U_i (bohr). For i=j, γ_{ii}(0) = 1 / a_i = U_i.
+      - Optional exponential damping exp(-kexp R) uses R in bohr; kexp thus has units 1/bohr.
+
     CN scaling: U_i = U0_{l_A} * (1 + kU_A * CN_A) (Eq. 102).
     """
     if device is None:
@@ -229,15 +235,17 @@ def compute_gamma2_shell(
     U0_shell = params.U0[z_list, l_indices]
     kU_shell = params.kU[z_list]
     U_shell = U0_shell * (1.0 + kU_shell * cn[atom_idx])  # Eq. 102 scaling
-    # Build R_AB per shell pair via atom indices
-    dist_atom = torch.cdist(pos, pos)  # (nat,nat)
-    R = dist_atom[atom_idx.unsqueeze(1), atom_idx.unsqueeze(0)]  # (n_shell,n_shell)
-    invU = 1.0 / U_shell
-    denom = R + 0.5 * (invU.unsqueeze(1) + invU.unsqueeze(0))
-    gamma = 1.0 / denom
+    # Build R_AB per shell pair via atom indices (convert Å → bohr for Coulomb units)
+    dist_atom = torch.cdist(pos, pos)  # (nat,nat), Å
+    ANGSTROM_TO_BOHR = torch.tensor(1.8897261254535, dtype=dtype, device=device)
+    Rb = dist_atom[atom_idx.unsqueeze(1), atom_idx.unsqueeze(0)] * ANGSTROM_TO_BOHR  # (n_shell,n_shell)
+    # Ohno-like mixing length a_i = 1/U_i (bohr), combined as arithmetic mean
+    ai = 1.0 / torch.clamp(U_shell, min=torch.finfo(dtype).eps)
+    aij = 0.5 * (ai.unsqueeze(1) + ai.unsqueeze(0))
+    denom = torch.sqrt(Rb * Rb + aij * aij)
+    gamma = 1.0 / torch.clamp(denom, min=torch.finfo(dtype).eps)
     if params.kexp != 0.0:
-        gamma = gamma * torch.exp(-params.kexp * R)
-    # On-site (i=j) automatically Ui (since denom = 0.5*(2/Ui) = 1/Ui)
+        gamma = gamma * torch.exp(-float(params.kexp) * Rb)
     return gamma
 
 

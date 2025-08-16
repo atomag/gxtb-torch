@@ -283,3 +283,82 @@ def overlap_shell_pair(l_i: int, l_j: int, alpha_i: Tensor, c_i: Tensor, alpha_j
     Ti = _metric_transform_for_shell(l_i, alpha_i, c_i)
     Tj = _metric_transform_for_shell(l_j, alpha_j, c_j)
     return Ti @ S_cart @ Tj.T
+
+
+def _one_d_recur_torch(l1: int, l2: int, PA: Tensor, PB: Tensor, gamma: Tensor, K0: Tensor) -> Tensor:
+    """Hermite 1D recurrence with torch tensors (autograd-friendly, no in-place writes).
+
+    Returns tensor of shape (l1+1, l2+1).
+    """
+    dev = PA.device
+    dtype = PA.dtype
+    inv2g = 1.0 / (2.0 * gamma)
+    # Build as Python list-of-lists of tensors to avoid in-place on views
+    S_list: list[list[Tensor]] = [[None for _ in range(l2 + 1)] for _ in range(l1 + 1)]  # type: ignore
+    S_list[0][0] = K0
+    # First column (j=0)
+    for i in range(1, l1 + 1):
+        prev2 = S_list[i - 2][0] if i > 1 else torch.zeros((), dtype=dtype, device=dev)
+        S_list[i][0] = PA * S_list[i - 1][0] + (i - 1) * inv2g * prev2
+    # First row (i=0)
+    for j in range(1, l2 + 1):
+        prev2 = S_list[0][j - 2] if j > 1 else torch.zeros((), dtype=dtype, device=dev)
+        S_list[0][j] = PB * S_list[0][j - 1] + (j - 1) * inv2g * prev2
+    # General case
+    for i in range(1, l1 + 1):
+        for j in range(1, l2 + 1):
+            term1 = PA * S_list[i - 1][j]
+            term2 = (i - 1) * inv2g * (S_list[i - 2][j] if i > 1 else torch.zeros((), dtype=dtype, device=dev))
+            term3 = j * inv2g * S_list[i - 1][j - 1]
+            S_list[i][j] = term1 + term2 + term3
+    rows = [torch.stack(S_list[i], dim=0) for i in range(l1 + 1)]
+    return torch.stack(rows, dim=0)
+
+
+def _overlap_cart_block_torch(li: int, lj: int, alpha_i: Tensor, c_i: Tensor, alpha_j: Tensor, c_j: Tensor, R: Tensor) -> Tensor:
+    """Cartesian overlap block (autograd-friendly tensor path)."""
+    cart_i = _cart_list(li)
+    cart_j = _cart_list(lj)
+    nci, ncj = len(cart_i), len(cart_j)
+    out = torch.zeros((nci, ncj), dtype=alpha_i.dtype, device=alpha_i.device)
+    # Components
+    Rx, Ry, Rz = R[0], R[1], R[2]
+    R2 = Rx * Rx + Ry * Ry + Rz * Rz
+    # Exponents/coefficients kept as tensors for autograd
+    max_ix = max(ci[0] for ci in cart_i); max_jx = max(cj[0] for cj in cart_j)
+    max_iy = max(ci[1] for ci in cart_i); max_jy = max(cj[1] for cj in cart_j)
+    max_iz = max(ci[2] for ci in cart_i); max_jz = max(cj[2] for cj in cart_j)
+    for ip in range(alpha_i.shape[0]):
+        a = alpha_i[ip]
+        ci_val = c_i[ip]
+        for jp in range(alpha_j.shape[0]):
+            b = alpha_j[jp]
+            cj_val = c_j[jp]
+            gamma = a + b
+            mu = a * b / gamma
+            Px = (b / gamma) * Rx; Py = (b / gamma) * Ry; Pz = (b / gamma) * Rz
+            PAx, PAy, PAz = Px, Py, Pz
+            PBx, PBy, PBz = Px - Rx, Py - Ry, Pz - Rz
+            K0 = (torch.tensor(pi, dtype=alpha_i.dtype, device=alpha_i.device) / gamma) ** 1.5 * torch.exp(-mu * R2)
+            Sx = _one_d_recur_torch(max_ix, max_jx, PAx, PBx, gamma, K0)
+            Sy = _one_d_recur_torch(max_iy, max_jy, PAy, PBy, gamma, torch.tensor(1.0, dtype=alpha_i.dtype, device=alpha_i.device))
+            Sz = _one_d_recur_torch(max_iz, max_jz, PAz, PBz, gamma, torch.tensor(1.0, dtype=alpha_i.dtype, device=alpha_i.device))
+            for ii, (lix, liy, liz) in enumerate(cart_i):
+                for jj, (ljx, ljy, ljz) in enumerate(cart_j):
+                    val = ci_val * cj_val * Sx[lix, ljx] * Sy[liy, ljy] * Sz[liz, ljz]
+                    basis = torch.zeros_like(out)
+                    basis[ii, jj] = 1.0
+                    out = out + basis * val
+    return out
+
+
+def overlap_shell_pair_torch(l_i: int, l_j: int, alpha_i: Tensor, c_i: Tensor, alpha_j: Tensor, c_j: Tensor, R: Tensor) -> Tensor:
+    """Real-spherical overlap for a shell pair with autograd support w.r.t. R.
+
+    This mirrors overlap_shell_pair but keeps all arithmetic in torch to allow
+    differentiation with respect to the intercenter vector R.
+    """
+    S_cart = _overlap_cart_block_torch(l_i, l_j, alpha_i, c_i, alpha_j, c_j, R)
+    Ti = _metric_transform_for_shell(l_i, alpha_i, c_i)
+    Tj = _metric_transform_for_shell(l_j, alpha_j, c_j)
+    return Ti @ S_cart @ Tj.T

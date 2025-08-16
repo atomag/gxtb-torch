@@ -281,6 +281,17 @@ def load_schema(path: str | Path) -> GxTBSchema:
             if li < 0 or ci < 0:
                 raise ValueError(f"Negative index in section 'qvszp': {(li,ci)}")
         object.__setattr__(schema, "qvszp", qmap)
+    # [eeq] section: column indices for chi, eta, radius in parameters/eeq
+    if "eeq" in data:
+        eeq = data["eeq"]
+        if not isinstance(eeq, dict):
+            raise ValueError("[eeq] section must be a table with keys 'chi','eta','radius'")
+        for key in ("chi", "eta", "radius"):
+            if key not in eeq:
+                raise ValueError("[eeq] must provide integer column indices for 'chi','eta','radius'")
+            if not isinstance(eeq[key], int) or eeq[key] < 0:
+                raise ValueError(f"[eeq].{key} must be a non-negative integer column index")
+        object.__setattr__(schema, "eeq", {"chi": int(eeq["chi"]), "eta": int(eeq["eta"]), "radius": int(eeq["radius"])})
     return schema
 
 

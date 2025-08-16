@@ -19,7 +19,7 @@ from math import pi, exp
 Tensor = torch.Tensor
 
 # Reuse helpers from overlap implementation
-from .md_overlap import _cart_list, _spherical_transform, _one_d_recur
+from .md_overlap import _cart_list, _one_d_recur, _metric_transform_for_shell
 
 __all__ = ["moment_shell_pair"]
 
@@ -162,9 +162,10 @@ def moment_shell_pair(
     device = alpha_i.device
     # Cartesian blocks
     Dx, Dy, Dz, Qxx, Qxy, Qxz, Qyy, Qyz, Qzz = _moment_cart_block(l_i, l_j, alpha_i, c_i, alpha_j, c_j, R)
-    # Transform to same spherical basis as overlap
-    Ti = _spherical_transform(l_i, dtype, device)
-    Tj = _spherical_transform(l_j, dtype, device)
+    # Transform to the same metric‑orthonormal spherical basis as overlap
+    # Ensures consistency: T S_cc T^T = I for on‑center contracted shells.
+    Ti = _metric_transform_for_shell(l_i, alpha_i, c_i)
+    Tj = _metric_transform_for_shell(l_j, alpha_j, c_j)
     def sph(M: Tensor) -> Tensor:
         return Ti @ M @ Tj.T
     return sph(Dx), sph(Dy), sph(Dz), sph(Qxx), sph(Qxy), sph(Qxz), sph(Qyy), sph(Qyz), sph(Qzz)

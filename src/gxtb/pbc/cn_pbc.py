@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import torch
 
-from .cell import build_lattice_translations
+from .cell import to_frac, to_cart
 
 __all__ = ["coordination_number_pbc"]
 
@@ -17,40 +17,46 @@ def coordination_number_pbc(
     cell: torch.Tensor,
     cutoff: float,
 ) -> torch.Tensor:
-    """Periodic CN per doc/theory/9_cn.md Eq. (47) summed over lattice images within cutoff (doc/theory/25).
+    """Periodic CN using minimum-image distances (doc/theory/9_cn.md Eq. 47; PBC handling per doc/theory/25).
 
-    positions: (nat,3) Cartesian Angstrom
-    numbers: (nat,) Z
-    r_cov: (Zmax+1,) covalent radii (same units as positions)
-    cutoff: real-space sum radius (Angstrom)
-    Returns CN: (nat,)
+    - Eq. 47: CN_A = Σ_{B≠A} 0.5 [1 + erf(k_cn (R_AB − R_cov,AB) / R_cov,AB)].
+    - PBC: use minimum-image displacement via fractional wrapping Δf -> Δf − round(Δf), then Δr = A Δf.
+      This counts each pair once (no lattice-image double counting).
+    - cutoff argument is required by API but not used in minimum-image evaluation; validated to be > 0.
+
+    Inputs
+    - positions: (nat,3) Cartesian Angstrom
+    - numbers: (nat,) atomic numbers Z
+    - r_cov: (Zmax+1,) covalent radii (same units as positions)
+    - k_cn: scalar CN sharpness parameter (positive)
+    - cell: (3,3) lattice matrix (Angstrom)
+    - cutoff: positive float (validated; not used)
+
+    Returns
+    - CN: (nat,) tensor
     """
     device = positions.device
     dtype = positions.dtype
-    nat = positions.shape[0]
+    nat = int(positions.shape[0])
+    if cutoff is None or float(cutoff) <= 0.0:
+        raise ValueError("coordination_number_pbc requires cutoff > 0 (validated by API); minimum-image path does not use it")
+    # Per-atom radii and pair-averaged radii
     z = numbers.long()
-
-    # Precompute element radii per atom and pair averages
     rc = r_cov[z].to(device=device, dtype=dtype)  # (nat,)
     rc_ab = 0.5 * (rc.unsqueeze(1) + rc.unsqueeze(0))  # (nat,nat)
-
-    # Lattice translations within cutoff (include origin)
-    T = build_lattice_translations(float(cutoff), cell)
-    cn = torch.zeros(nat, dtype=dtype, device=device)
+    # Fractional coordinates and minimum-image fractional differences
+    f = to_frac(positions, cell.to(device=device, dtype=dtype))  # (nat,3)
+    df = f.unsqueeze(1) - f.unsqueeze(0)  # (nat,nat,3)
+    df_mi = df - torch.round(df)  # wrap to [-0.5,0.5) per component
+    # Convert back to Cartesian displacements
+    df_flat = df_mi.view(-1, 3)
+    dr_flat = to_cart(df_flat, cell.to(device=device, dtype=dtype))  # (nat*nat,3)
+    dr = dr_flat.view(nat, nat, 3)
+    dist = torch.linalg.norm(dr, dim=-1)  # (nat,nat)
+    # Exclude self terms
+    mask = ~torch.eye(nat, dtype=torch.bool, device=device)
     eps = torch.finfo(dtype).eps
-    # Sum contributions over images
-    for (i, j, k) in T:
-        R = i * cell[0] + j * cell[1] + k * cell[2]
-        pos_B = positions + R
-        rij = positions.unsqueeze(1) - pos_B.unsqueeze(0)  # (nat,nat,3)
-        dist = torch.linalg.norm(rij, dim=-1)  # (nat,nat)
-        # Exclude self terms for the home cell only
-        if i == 0 and j == 0 and k == 0:
-            mask = ~torch.eye(nat, dtype=torch.bool, device=device)
-        else:
-            mask = torch.ones((nat, nat), dtype=torch.bool, device=device)
-        x = k_cn * (dist - rc_ab) / torch.clamp(rc_ab, min=eps)
-        contrib = 0.5 * (1.0 + torch.erf(x))
-        cn = cn + (contrib * mask).sum(dim=1)
+    x = float(k_cn) * (dist - rc_ab) / torch.clamp(rc_ab, min=eps)
+    contrib = 0.5 * (1.0 + torch.erf(x))
+    cn = (contrib * mask).sum(dim=1)
     return cn
-

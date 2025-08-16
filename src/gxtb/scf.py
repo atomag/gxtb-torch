@@ -42,6 +42,10 @@ class SCFResult:
     V_shell: Tensor | None = None   # shell potentials V^{(2)} (Eq. 106) if available
     P_alpha: Tensor | None = None
     P_beta: Tensor | None = None
+    C_alpha: Tensor | None = None
+    C_beta: Tensor | None = None
+    eps_alpha: Tensor | None = None
+    eps_beta: Tensor | None = None
     E_AES: Tensor | None = None  # anisotropic electrostatics energy (Sec. 1.11.1)
     E_OFX: Tensor | None = None  # onsite Fock exchange correction energy (Sec. 1.16)
     E_MFX: Tensor | None = None  # long-range MFX exchange energy (doc/theory/20)
@@ -571,12 +575,18 @@ def scf(
         S_current = (evecs * evals_clamped) @ evecs.T
         # Löwdin orthogonalization X = S^{-1/2} (doc/theory/5, Eq. 12 context)
         X = (evecs * evals_clamped.rsqrt()) @ evecs.T
-        shift_atom = gamma[numbers.long()] * q
-        if gamma3 is not None:
-            shift_atom = shift_atom + gamma3[numbers.long()] * q.pow(3)
-        shift_ao = shift_atom[ao_atoms.long()]
+        # Start from EHT core
         H = H0.clone()
-        H.diagonal().add_(shift_ao)
+        # Hubbard-like onsite diagonal shift approximation for charge coupling.
+        # Apply only if structured second/third/fourth-order terms are NOT enabled,
+        # to avoid double-counting Eq. 105b contributions.
+        apply_hubbard_diag = not (second_order or third_order or fourth_order)
+        if apply_hubbard_diag:
+            shift_atom = gamma[numbers.long()] * q
+            if gamma3 is not None:
+                shift_atom = shift_atom + gamma3[numbers.long()] * q.pow(3)
+            shift_ao = shift_atom[ao_atoms.long()]
+            H.diagonal().add_(shift_ao)
         # Fourth-order onsite Fock (Eq. 143)
         E4_current = None
         if fourth_order:
@@ -721,6 +731,11 @@ def scf(
             P_a, P_b = Pa_new, Pb_new
             eps_vals = 0.5 * (eps_a + eps_b)
             C = 0.5 * (Ca + Cb)
+            # Store spin-resolved MO sets
+            eps_a_last = eps_a
+            eps_b_last = eps_b
+            Ca_last = Ca
+            Cb_last = Cb
             # Update shell magnetizations for next step
             if use_spin:
                 from .hamiltonian.spin import compute_shell_magnetizations
@@ -732,9 +747,17 @@ def scf(
         if shell_mode and shell_params_obj is not None and ref_shell_pops is not None:
             from .hamiltonian.second_order_tb import compute_shell_charges
             shell_q = compute_shell_charges(P_new, S, basis, ref_shell_pops)
-        # Electronic energy (first-order expectation). Note that AES energy is accumulated separately
-        # using the density used to form H^{AES} (Eqs. 109–111). Here we keep Tr(P H) history for convergence.
-        E_el = torch.einsum('ij,ji->', P_new, H)
+        # Electronic energy bookkeeping for convergence and output.
+        # Use Tr(P H0) plus explicit many-body energy terms to avoid double counting
+        # Fock-like contributions added to H (doc/theory/15 Eq. 100b; Eq. 105b–106).
+        E_tr = torch.einsum('ij,ji->', P_new, H0)
+        E_el = E_tr
+        if 'E2_current' in locals() and E2_current is not None:
+            E_el = E_el + E2_current
+        if 'E3_current' in locals() and E3_current is not None:
+            E_el = E_el + E3_current
+        if 'E4_current' in locals() and E4_current is not None:
+            E_el = E_el + E4_current
         # Adaptive mixing: handle non-finite energies by reducing beta and restarting charge update
         if not torch.isfinite(E_el):
             if restart_on_nan:
@@ -786,6 +809,13 @@ def scf(
         eps_orb = eps_vals
         q_prev = q.clone()
     E_final = torch.tensor(E_history[-1], dtype=S.dtype, device=S.device) if E_history else None
-    return SCFResult(H=H, P=P, P_alpha=P_a, P_beta=P_b, q=q, q_ref=q_ref, eps=eps_orb, C=C, n_iter=it, converged=converged, E_elec=E_final,
+    # Attach spin-resolved MO data if available
+    C_alpha = locals().get('Ca_last', None)
+    C_beta = locals().get('Cb_last', None)
+    eps_alpha = locals().get('eps_a_last', None)
+    eps_beta = locals().get('eps_b_last', None)
+    return SCFResult(H=H, P=P, P_alpha=P_a, P_beta=P_b, C_alpha=C_alpha, C_beta=C_beta,
+                     eps_alpha=eps_alpha, eps_beta=eps_beta,
+                     q=q, q_ref=q_ref, eps=eps_orb, C=C, n_iter=it, converged=converged, E_elec=E_final,
                      E2=E2_current, E3=E3_current, E4=E4_current, E_history=E_history, dq_shell=dq_shell_current, V_shell=V_shell_current,
                      E_AES=E_AES_current, E_OFX=E_OFX_current, E_MFX=E_MFX_current, E_ACP=E_ACP_current, S=S_current)
