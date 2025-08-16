@@ -114,3 +114,21 @@ def test_pbc_gamma_with_d4_two_body_runs():
     atoms.calc = calc
     e = atoms.get_potential_energy()
     assert isinstance(e, float)
+
+
+def test_pbc_aes_requires_scf_k_and_cutoff():
+    from ase import Atoms
+    a = 5.0
+    atoms = Atoms('He', positions=[[0.0, 0.0, 0.0]], cell=[[a,0,0],[0,a,0],[0,0,a]], pbc=True)
+    # AES not allowed for eht-k
+    from gxtb.ase_calc import GxTBCalculator
+    calc = GxTBCalculator(parameters_dir='parameters', pbc_mode='eht-k', mp_grid=(1,1,1), mp_shift=(0,0,0), pbc_cutoff=4.0, pbc_cn_cutoff=4.0, enable_second_order=False, enable_aes=True, device='cpu')
+    atoms.calc = calc
+    import pytest
+    with pytest.raises(NotImplementedError):
+        _ = atoms.get_potential_energy()
+    # scf-k requires pbc_aes_cutoff
+    calc = GxTBCalculator(parameters_dir='parameters', pbc_mode='scf-k', mp_grid=(1,1,1), mp_shift=(0,0,0), pbc_cutoff=4.0, pbc_cn_cutoff=4.0, enable_second_order=True, ewald_eta=0.3, ewald_r_cut=6.0, ewald_g_cut=8.0, enable_aes=True, device='cpu')
+    atoms.calc = calc
+    with pytest.raises(ValueError):
+        _ = atoms.get_potential_energy()
