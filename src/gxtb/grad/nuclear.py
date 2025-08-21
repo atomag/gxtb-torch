@@ -344,6 +344,12 @@ def total_gradient(
     include_fourth_order: bool = False,
     fourth_params: object | None = None,  # FourthOrderParams
     fourth_q: Tensor | None = None,
+    # Repulsion (doc/theory/11): energy Eq. 52; gradient Eqs. 57–61
+    include_repulsion: bool = False,
+    repulsion_params: object | None = None,  # RepulsionParams
+    eeq: object | None = None,
+    total_charge: float = 0.0,
+    repulsion_dq_dpos: Tensor | None = None,
 ) -> Tensor:
     """Aggregate nuclear gradient contributions for currently implemented components.
 
@@ -461,5 +467,37 @@ def total_gradient(
             raise ValueError("Spin gradient requires spin_params, P_alpha, and P_beta (doc/theory/17)")
         Esp, gsp = grad_spin_energy(numbers, positions, basis, P_alpha, P_beta, spin_params)
         dE = dE + gsp
+
+    # --- Semi-classical repulsion (doc/theory/11) ---
+    if include_repulsion:
+        # Build parameters if not provided
+        if repulsion_params is None:
+            from ..params.schema import map_repulsion_params, map_cn_params
+            from ..classical.repulsion import RepulsionParams as _RParams
+            rp = map_repulsion_params(gparams, schema)
+            cnm = map_cn_params(gparams, schema)
+            repulsion_params = _RParams(
+                z_eff0=rp['z_eff0'], alpha0=rp['alpha0'], kq=rp['kq'], kq2=rp['kq2'],
+                kcn_elem=rp['kcn'], r0=rp['r0'],
+                kpen1_hhe=float(rp['kpen1_hhe']), kpen1_rest=float(rp['kpen1_rest']),
+                kpen2=float(rp['kpen2']), kpen3=float(rp['kpen3']), kpen4=float(rp['kpen4']),
+                kexp=float(rp['kexp']), r_cov=cnm['r_cov'], k_cn=float(cnm['k_cn'])
+            )
+        # Charges: if not provided, compute via EEQ with schema mapping
+        if q_eeqbc is None:
+            if eeq is None:
+                raise ValueError("Repulsion gradient requires q_eeqbc or eeq parameters to compute EEQ charges (doc/theory/11 Eq. 53)")
+            from ..charges.eeq import compute_eeq_charges
+            mapping = getattr(schema, 'eeq', None)
+            if mapping is not None and isinstance(mapping, dict):
+                mp = {'chi': mapping['chi'], 'eta': mapping['eta'], 'radius': mapping['radius']}
+            else:
+                mp = None
+            q_eeqbc = compute_eeq_charges(numbers, positions, eeq, total_charge=total_charge, mapping=mp, device=positions.device, dtype=positions.dtype)
+        # Evaluate gradient
+        from ..classical.repulsion import repulsion_energy_and_gradient as _Erep
+        # This call will raise a clear error if k^q/k^{q,2} are non-zero and repulsion_dq_dpos is missing (Eq. 58)
+        _E, grep = _Erep(positions, numbers, repulsion_params, q_eeqbc, dq_dpos=repulsion_dq_dpos)
+        dE = dE + grep
 
     return dE
