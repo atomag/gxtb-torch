@@ -159,6 +159,31 @@ pp_off = [8, 2]
 dd_off = [8, 3]
 ff_off = [8, 5]
 
+# First-order TB (doc/theory/14_first_order_tb.md, Eqs. 83–84)
+# Per-element shell coefficients μ^{(1),0}_l (l = s,p,d,f) and k^{(1),CN}_A.
+# Index policy: choose unused element slots to avoid collision with mapped sections above.
+# - mu10_s: L2 C2 (line index 1, col 2)
+# - mu10_p: L2 C3 (line index 1, col 3)
+# - mu10_d: L7 C1 (line index 6, col 0)
+# - mu10_f: L8 C4 (line index 7, col 3)
+# - kCN1:   L8 C5 (line index 7, col 4)
+[first_order]
+mu10_s = [1, 2]
+mu10_p = [1, 3]
+mu10_d = [6, 0]
+mu10_f = [7, 3]
+kCN1   = [7, 4]
+
+# First-order global switching parameters for f^{(1)}(q) (Eq. 83b): kdis, kx, ks.
+# Note: All global line slots are occupied by other sections; we explicitly reuse entries here.
+# Users providing first-order TB via runtime params can ignore these indices.
+# We map to global line1 columns [7,8,9] which already host gamma4/dmp3/dmp5; this is a deterministic reuse,
+# not a silent default. If dedicated slots become available upstream, update these indices accordingly.
+[first_order_global]
+kdis = [1, 7]
+kx   = [1, 8]
+ks   = [1, 9]
+
 # [mfx]
 # Range-separated MFX global parameters (doc/theory/20, Eqs. 149–153).
 # NOTE: All known global slots are already in use by other sections:
