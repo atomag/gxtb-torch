@@ -281,6 +281,24 @@ def d4_energy(numbers: Tensor, positions: Tensor, charges: Tensor, method: D4Met
     return E
 
 
+def d4_energy_with_grad(
+    numbers: Tensor,
+    positions: Tensor,
+    charges: Tensor,
+    method: D4Method,
+    ref: dict,
+) -> tuple[Tensor, Tensor]:
+    """Return (E^{D4}, ∂E/∂R) for molecular (non-PBC) case via autograd.
+
+    Computes E using d4_energy_components (two-body + ATM) and differentiates w.r.t. positions.
+    All inputs must be torch tensors on the same device/dtype.
+    """
+    pos_req = positions.detach().clone().requires_grad_(True)
+    _, _, E = d4_energy_components(numbers, pos_req, charges.to(pos_req), method, ref)
+    grad, = torch.autograd.grad(E, pos_req, create_graph=False)
+    return E.detach(), grad.detach()
+
+
 def revd4_energy(
     numbers: Tensor,
     positions: Tensor,

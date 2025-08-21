@@ -123,6 +123,9 @@ def compute_total_energy(
     # MFX long-range exchange (disabled by default)
     mfx: bool = False,
     mfx_params: Optional[dict] = None,
+    # First-order TB (doc/theory/14)
+    first_order: bool = False,
+    first_order_params: Optional[dict] = None,
     # Dispersion (DFT-D4 only here): energy added post-SCF (no Fock coupling)
     dispersion: bool = False,
     dispersion_params: Optional[dict] = None,
@@ -301,6 +304,7 @@ def compute_total_energy(
         third_shell_params=third_shell_pack,
         third_params=third_param_pack,
         mfx=mfx, mfx_params=mfx_pack,
+        first_order=first_order, first_order_params=first_order_params,
         spin=spin, spin_params=spin_param_pack,
         aes=aes, aes_params=aes_pack,
         ofx=ofx, ofx_params=ofx_pack,
@@ -309,6 +313,9 @@ def compute_total_energy(
         dynamic_overlap=True,
         qvszp_params=qv_pack,
         q_reference=None,  # neutral reference state for Δq (doc/theory/3)
+        # Provide parameter sources for optional schema-driven first-order mapping
+        gparams=gparams,
+        schema=schema,
     )
 
     # First-order energy from H0 (Eq. 63). Build H0 with final dynamic coefficients for consistency.
@@ -412,7 +419,9 @@ def compute_total_energy(
         E_corr = E_corr + res.E_MFX
     if hasattr(res, 'E_ACP') and res.E_ACP is not None:
         E_corr = E_corr + res.E_ACP
-    E_total = E_el + E_shift + (E3 if E3 is not None else 0.0) + (E4 if E4 is not None else 0.0) + E_spin + (E_disp if E_disp is not None else 0.0) + E_corr
+    # Include first-order TB energy from SCF if available (doc/theory/14)
+    E_first_tb = res.E_First if hasattr(res, 'E_First') and res.E_First is not None else 0.0
+    E_total = E_el + E_shift + (E3 if E3 is not None else 0.0) + (E4 if E4 is not None else 0.0) + E_spin + (E_disp if E_disp is not None else 0.0) + E_corr + E_first_tb
     return EnergyBreakdown(E_total=E_total, E_el=E_el, E1=E1, E2=E2, E_rep=E_rep, E_incr=E_incr, E_shift=E_shift, scf=res, E3=E3, E_disp=E_disp)
 
 
@@ -447,6 +456,8 @@ def energy_report(res: EnergyBreakdown) -> Dict[str, float]:
         out['E_MFX'] = float(res.scf.E_MFX.item())
     if hasattr(res.scf, 'E_ACP') and res.scf.E_ACP is not None:
         out['E_ACP'] = float(res.scf.E_ACP.item())
+    if hasattr(res.scf, 'E_First') and res.scf.E_First is not None:
+        out['E1_TB'] = float(res.scf.E_First.item())
     # SCF info
     out['scf_n_iter'] = int(res.scf.n_iter)
     out['scf_converged'] = 1 if res.scf.converged else 0

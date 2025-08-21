@@ -12,6 +12,8 @@ Features:
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 import torch
+from .cn import coordination_number
+from .params.schema import map_cn_params
 
 Tensor = torch.Tensor
 
@@ -50,6 +52,7 @@ class SCFResult:
     E_OFX: Tensor | None = None  # onsite Fock exchange correction energy (Sec. 1.16)
     E_MFX: Tensor | None = None  # long-range MFX exchange energy (doc/theory/20)
     E_ACP: Tensor | None = None  # atomic correction potentials energy (doc/theory/13)
+    E_First: Tensor | None = None  # first-order TB energy (doc/theory/14)
     S: Tensor | None = None      # final overlap S^{sc} used for orthogonalization (doc/theory/5, Eq. 12)
 
 
@@ -130,6 +133,9 @@ def scf(
     third_params: Optional[Dict[str, Tensor]] = None,  # expects dict packing ThirdOrderParams tensors
     mfx: bool = False,
     mfx_params: Optional[Dict[str, Tensor]] = None,  # expects {'alpha','omega','k1','k2','U_shell','xi_l','R0'(optional)}
+    # First-order TB (doc/theory/14): onsite + offsite
+    first_order: bool = False,
+    first_order_params: Optional[Dict[str, object]] = None,  # expects {'mu10':(Z,4),'kCN':(Z,), 'kdis':float,'kx':float,'ks':float}
     spin: bool = False,
     spin_params: Optional[Dict[str, Tensor]] = None,  # expects {'kW': (Zmax+1,), 'W0': (4,4)}
     # AES anisotropic electrostatics controls (doc/theory/16, Eqs. 109–111, 110a–b)
@@ -151,6 +157,9 @@ def scf(
     qvszp_params: Optional[Dict[str, object]] = None,  # expects {'k0','k1','k2','k3': (Zmax+1,), 'r_cov': Tensor, 'k_cn': float}
     # Numerical safety knobs
     spd_floor: float = 1e-8,  # minimum eigenvalue for S SPD projection used in Löwdin and Mulliken
+    # Parameter mapping sources (optional): provide to enable schema-driven first-order mapping
+    gparams: object | None = None,
+    schema: object | None = None,
 ) -> SCFResult:
     """Iterative SCF updating Hubbard onsite shifts until Mulliken charges converge."""
     nao = S.shape[0]
@@ -216,7 +225,6 @@ def scf(
         if 'cn' in so_params:
             cn_tensor = so_params['cn'].to(S.device)
         elif 'r_cov' in so_params and 'k_cn' in so_params:
-            from .cn import coordination_number
             cn_tensor = coordination_number(positions, numbers, so_params['r_cov'].to(S.device), float(so_params['k_cn']))
         else:
             cn_tensor = torch.zeros(len(numbers), dtype=S.dtype, device=S.device)
@@ -589,6 +597,8 @@ def scf(
             H.diagonal().add_(shift_ao)
         # Fourth-order onsite Fock (Eq. 143)
         E4_current = None
+        # First-order TB energy accumulator (doc/theory/14)
+        E1TB_current = None
         if fourth_order:
             if fourth_params is None or 'gamma4' not in fourth_params:
                 raise ValueError("fourth_order enabled but missing 'gamma4' in fourth_params (Eq. 140b/143)")
@@ -634,6 +644,52 @@ def scf(
                 # F^{(2)}_{μν} = 1/2 S_{μν} ( V_A + V_B ), with V = γ^{(2)} Δq (Eq. 103)
                 add_second_order_fock(H, S_current, ao_atoms, shifts2)
                 E2_current = second_order_energy(gamma2, q, q_ref)
+        # First-order TB (doc/theory/14) block (after second-order)
+        if first_order:
+            from .hamiltonian.first_order import (
+                FirstOrderParams as _FOParams,
+                first_order_onsite_energy_fock as _fo_on,
+                first_order_offsite_energy_fock as _fo_off,
+                build_delta_rho0_shell as _build_dr0,
+            )
+            # Params: from mapping if not provided
+            if first_order_params is None:
+                if gparams is None or schema is None:
+                    raise ValueError("first_order=True without first_order_params requires 'gparams' and 'schema' for mapping")
+                from .params.schema import map_first_order_params as _map_fo
+                fop = _map_fo(gparams, schema)  # eq: 83–84 via schema indices
+            else:
+                fop = first_order_params
+            if not all(k in fop for k in ('mu10','kCN','kdis','kx','ks')):
+                raise ValueError("first_order_params must contain 'mu10','kCN','kdis','kx','ks'")
+            fop_obj = _FOParams(
+                mu10=fop['mu10'] if isinstance(fop['mu10'], torch.Tensor) else torch.as_tensor(fop['mu10'], dtype=S.dtype, device=S.device),
+                kCN=fop['kCN'] if isinstance(fop['kCN'], torch.Tensor) else torch.as_tensor(fop['kCN'], dtype=S.dtype, device=S.device),
+                kdis=float(fop['kdis']), kx=float(fop['kx']), ks=float(fop['ks'])
+            )
+            # Ensure shell charges are available for onsite and offsite
+            if ('ref_shell_pops' not in locals()) or (locals().get('ref_shell_pops', None) is None) or (locals().get('shell_q', None) is None):
+                from .hamiltonian.second_order_tb import compute_reference_shell_populations as _ref_p0, compute_shell_charges as _qsh
+                ref_shell_pops = _ref_p0(numbers, basis).to(S.device, dtype=S.dtype)
+                shell_q = _qsh(P, S_current, basis, ref_shell_pops)
+            # CN vector from qvszp_params (doc/theory/7 Eq. 28 inputs are required; no hidden defaults)
+            if qvszp_params is None or 'r_cov' not in qvszp_params or 'k_cn' not in qvszp_params:
+                raise ValueError("first_order=True requires qvszp_params with 'r_cov' and 'k_cn' to compute CN (Eq. 84)")
+            cn_vec = coordination_number(positions, numbers, qvszp_params['r_cov'].to(S.device, dtype=S.dtype), float(qvszp_params['k_cn']))
+            # Onsite E/F
+            E_on, F_on = _fo_on(numbers, positions, basis, shell_q.to(S.dtype), q.to(S.dtype), cn_vec.to(S.dtype), S_current, fop_obj)
+            H = H + F_on
+            E1TB_current = E_on
+            # Offsite E/F requires γ^{(2)} on shells and Δρ0
+            from .hamiltonian.second_order_tb import build_shell_second_order_params as _build_sp, compute_gamma2_shell as _gamma_sh
+            # Build per-element U0 from the provided Hubbard map (atomic-level gamma as baseline)
+            sp = _build_sp(int(numbers.max().item()), hubbard['gamma'])
+            gamma_shell = _gamma_sh(numbers, positions, basis, sp, cn_vec)
+            dr0 = _build_dr0(numbers, basis).to(S.device, dtype=S.dtype)
+            E_off, F_off = _fo_off(numbers, positions, basis, shell_q.to(S.dtype), dr0, gamma_shell.to(S.dtype), S_current)
+            H = H + F_off
+            E1TB_current = (E1TB_current if E1TB_current is not None else 0.0) + E_off
+
         # AES Fock update before diagonalization (Eq. 109 with 110a–b)
         E_AES_current = None
         if use_aes and S_mono is not None and Dm is not None and Qm is not None:
@@ -660,7 +716,6 @@ def scf(
         if use_disp and disp_mode == 'd4s':
             from .classical.dispersion import compute_d4s_atomic_potential
             if disp_cn_input is None:
-                from .cn import coordination_number
                 cn_vec = coordination_number(positions, numbers, disp_r_cov.to(S.device, dtype=S.dtype), disp_k_cn)
             else:
                 cn_vec = disp_cn_input.to(S.device, dtype=S.dtype)
@@ -818,4 +873,4 @@ def scf(
                      eps_alpha=eps_alpha, eps_beta=eps_beta,
                      q=q, q_ref=q_ref, eps=eps_orb, C=C, n_iter=it, converged=converged, E_elec=E_final,
                      E2=E2_current, E3=E3_current, E4=E4_current, E_history=E_history, dq_shell=dq_shell_current, V_shell=V_shell_current,
-                     E_AES=E_AES_current, E_OFX=E_OFX_current, E_MFX=E_MFX_current, E_ACP=E_ACP_current, S=S_current)
+                     E_AES=E_AES_current, E_OFX=E_OFX_current, E_MFX=E_MFX_current, E_ACP=E_ACP_current, E_First=E1TB_current, S=S_current)

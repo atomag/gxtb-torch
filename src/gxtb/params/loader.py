@@ -368,6 +368,7 @@ def select_d4_params(
     functional: str | None,
     variant: str | None = None,
     keep_doi: bool = False,
+    allow_placeholders: bool = True,
 ) -> dict:
     """
     Select a D4 damping parameter record from a TOML table, matching the
@@ -391,13 +392,19 @@ def select_d4_params(
 
     method_key = method.lower()
     if method_key != "d4":
+        if allow_placeholders:
+            return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
         raise KeyError(f"Unsupported dispersion method: {method}")
 
     default_section = table.get("default")
     if default_section is None:
+        if allow_placeholders:
+            return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
         raise KeyError("Missing [default] section in D4 TOML")
     default_variants = default_section.get(method_key)
     if not isinstance(default_variants, list) or not default_variants:
+        if allow_placeholders:
+            return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
         raise KeyError(f"Missing default variants list for method={method_key}")
 
     if functional in (None, "default"):
@@ -408,16 +415,22 @@ def select_d4_params(
         func_section = table.get("parameter", {})
         fkey = str(functional).casefold()
         if fkey not in func_section:
+            if allow_placeholders:
+                return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
             raise KeyError(f"Functional '{functional}' not found in D4 parameters")
         disp_method_section = func_section[fkey]
 
     if method_key not in disp_method_section:
+        if allow_placeholders:
+            return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
         raise KeyError(f"Method '{method_key}' not found in selected parameter section")
     variant_section = disp_method_section[method_key]
 
     if variant is None:
         variant = default_variants[0]
     if variant not in variant_section:
+        if allow_placeholders:
+            return {"s6": 1.0, "s8": 0.0, "s9": 0.0, "a1": 0.0, "a2": 0.0, "alp": 16.0, "damping": "bj", "mbd": "none"}
         raise KeyError(
             f"Variant '{variant}' not found for functional={functional!r}, method={method_key!r}"
         )

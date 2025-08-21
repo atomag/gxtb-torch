@@ -349,6 +349,12 @@ def eht_energy_gradient(
         from ..basis.qvszp import compute_effective_charge
         q_eff = compute_effective_charge(numbers, positions, q_scf, q_eeq, r_cov=r_cov, k_cn=k_cn, k0=k0, k1=k1, k2=k2, k3=k3)
         coeff = [c0[i] + c1v[i] * q_eff[atom_idx[i]] for i in range(n_shell)]
+        # Precompute spherical transforms for each shell using the physical contracted coeffs (cached in md_overlap)
+        from ..basis.md_overlap import _metric_transform_for_shell as _T_sph
+        T_sph = [
+            _T_sph(l_idx[i], alpha[i], coeff[i])
+            for i in range(n_shell)
+        ]
 
         # Accumulate gradient vector dE/dR_X over atoms X (nat,3)
         dE_cn = torch.zeros((nat, 3), dtype=dtype, device=device)
@@ -387,9 +393,9 @@ def eht_energy_gradient(
                 # Contributions: dS/dq_eff(A): overlap(c1_i, c_j) if shell i on A; plus overlap(c_i, c1_j) if shell j on A
                 # Use spherical transforms computed from the physical contracted shells (ci,cj) to avoid
                 # degenerate on-center metrics when c1 vectors are zero.
-                from ..basis.md_overlap import _metric_transform_for_shell as _T_sph, _overlap_cart_block as _S_cart
-                Ti = _T_sph(l_idx[i], ai, ci)
-                Tj = _T_sph(l_idx[j], aj, cj)
+                from ..basis.md_overlap import _overlap_cart_block as _S_cart
+                Ti = T_sph[i]
+                Tj = T_sph[j]
                 dS_A = torch.zeros((ni, nj), dtype=dtype, device=device)
                 if atom_idx[i].item() == A:
                     Sc = _S_cart(l_idx[i], l_idx[j], ai, c1i, aj, cj, R)

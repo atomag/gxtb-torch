@@ -24,6 +24,10 @@ __all__ = [
     "grad_aes_energy",
     "grad_third_order_energy",
     "grad_fourth_order_energy",
+    "grad_ofx_energy",
+    "grad_mfx_energy",
+    "grad_acp_energy",
+    "grad_spin_energy",
     "total_gradient",
 ]
 
@@ -121,6 +125,177 @@ def grad_fourth_order_energy(
     return E4, dE
 
 
+def _build_S_raw_torch(numbers: Tensor, positions: Tensor, basis, coeffs_map: Dict[int, Tensor] | None = None) -> Tensor:
+    """Differentiable raw AO overlap S using McMurchie–Davidson torch kernel (doc/theory/8, Eq. 31 context).
+
+    - If coeffs_map is None, use static q‑vSZP baseline c0 per shell (doc/theory/7 Eqs. 8–11 with q_eff=0).
+    - Returns symmetric S (enforces 0.5(S+S^T)).
+    """
+    from ..basis.md_overlap import overlap_shell_pair_torch as _ov_sph_t
+    shells = basis.shells
+    ao_off = basis.ao_offsets
+    ao_cnt = basis.ao_counts
+    dtype = positions.dtype
+    device = positions.device
+    nao = basis.nao
+    S = torch.zeros((nao, nao), dtype=dtype, device=device)
+    alpha = [torch.tensor([p[0] for p in sh.primitives], dtype=dtype, device=device) for sh in shells]
+    if coeffs_map is None:
+        coeffs = [torch.tensor([p[1] for p in sh.primitives], dtype=dtype, device=device) for sh in shells]
+    else:
+        coeffs = [coeffs_map[i].to(device=device, dtype=dtype) for i in range(len(shells))]
+    lmap = {"s":0, "p":1, "d":2, "f":3}
+    for i, shi in enumerate(shells):
+        li = lmap[shi.l]
+        ai = alpha[i]; ci = coeffs[i]
+        oi, ni = ao_off[i], ao_cnt[i]
+        for j in range(i, len(shells)):
+            shj = shells[j]
+            lj = lmap[shj.l]
+            aj = alpha[j]; cj = coeffs[j]
+            oj, nj = ao_off[j], ao_cnt[j]
+            R = positions[shi.atom_index] - positions[shj.atom_index]
+            block = _ov_sph_t(li, lj, ai, ci, aj, cj, R)
+            S[oi:oi+ni, oj:oj+nj] = block
+            if j != i:
+                S[oj:oj+nj, oi:oi+ni] = block.T
+    return 0.5 * (S + S.T)
+
+
+def grad_ofx_energy(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    P: Tensor,
+    params,
+    *,
+    coeffs_map: Dict[int, Tensor] | None = None,
+) -> Tuple[Tensor, Tensor]:
+    """Return (E^{OFX}, dE^{OFX}/dR) per doc/theory/21_ofx.md using differentiable S.
+
+    Assumptions:
+      - Λ^0_{AO} provided in params (OFXParams) and independent of positions.
+      - Dual density ẐP uses raw AO overlap S (Eq. 156).
+      - P is held fixed (kernel-only gradient via ∂S/∂R path).
+    """
+    from ..hamiltonian.ofx import ofx_energy as _Eofx
+    pos_req = positions.detach().clone().requires_grad_(True)
+    S = _build_S_raw_torch(numbers, pos_req, basis, coeffs_map)
+    E = _Eofx(numbers, basis, P.to(S), S, params)
+    grad, = torch.autograd.grad(E, pos_req, create_graph=False)
+    return E.detach(), grad.detach()
+
+
+def grad_mfx_energy(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    P: Tensor,
+    params,
+    *,
+    coeffs_map: Dict[int, Tensor] | None = None,
+) -> Tuple[Tensor, Tensor]:
+    """Return (E^{lr,MFX}, dE/dR) per doc/theory/20_mfx.md.
+
+    Differentiates through both γ^{MFX}(R) (Eq. 149) and AO overlap S used in the symmetric Fock construction (Eq. 153).
+    P held fixed.
+    """
+    from ..hamiltonian.mfx import build_gamma_ao, mfx_fock, mfx_energy
+    pos_req = positions.detach().clone().requires_grad_(True)
+    S = _build_S_raw_torch(numbers, pos_req, basis, coeffs_map)
+    gamma = build_gamma_ao(numbers, pos_req, basis, params)
+    F = mfx_fock(P.to(S), S, gamma)
+    E = mfx_energy(P.to(S), F)
+    grad, = torch.autograd.grad(E, pos_req, create_graph=False)
+    return E.detach(), grad.detach()
+
+
+def grad_acp_energy(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    P: Tensor,
+    *,
+    c0: Tensor,
+    xi: Tensor,
+    k_acp_cn: float,
+    cn_avg: Tensor,
+    r_cov: Tensor,
+    k_cn: float,
+    l_list: tuple[str, ...] = ("s","p","d"),
+) -> Tuple[Tensor, Tensor]:
+    """Return (E^{ACP}, dE^{ACP}/dR) via differentiable S^{ACP} (doc/theory/13_acp.md Eqs. 78–80).
+
+    Builds AO–ACP projector overlap using torch MD kernel and differentiates E=Tr(H^{ACP} ∘ P) with H^{ACP}=S^{ACP}S^{ACP}^T.
+    """
+    from ..cn import coordination_number
+    from ..hamiltonian.acp import acp_energy as _Eacp
+    pos_req = positions.detach().clone().requires_grad_(True)
+    device = pos_req.device; dtype = pos_req.dtype
+    # CN-dependent coefficients per Eq. 80
+    cn = coordination_number(pos_req, numbers, r_cov.to(device=device, dtype=dtype), float(k_cn))
+    shells = basis.shells
+    nao = basis.nao
+    l_map = {"s":0, "p":1, "d":2, "f":3}
+    dims = {"s":1, "p":3, "d":5, "f":7}
+    naux = sum(dims[l] for _ in range(len(numbers)) for l in l_list)
+    S_acp = torch.zeros((nao, naux), dtype=dtype, device=device)
+    col_off = 0
+    from ..basis.md_overlap import overlap_shell_pair_torch as _ov_sph_t
+    alpha_i = [torch.tensor([p[0] for p in sh.primitives], dtype=dtype, device=device) for sh in shells]
+    coeff_i = [torch.tensor([p[1] + p[2] for p in sh.primitives], dtype=dtype, device=device) for sh in shells]
+    for A in range(len(numbers)):
+        Z = int(numbers[A].item())
+        for l in l_list:
+            ell = l_map[l]; nprj = dims[l]
+            c0_Zl = c0[Z, ell].to(device=device, dtype=dtype)
+            xi_Zl = xi[Z, ell].to(device=device, dtype=dtype)
+            cn_avg_Z = cn_avg[Z].to(device=device, dtype=dtype)
+            if float(cn_avg_Z.item()) == 0.0:
+                raise ValueError("cn_avg[Z] must be non-zero (doc/theory/13 Eq. 80)")
+            c_acp = c0_Zl * (1.0 + float(k_acp_cn) * (cn[A] / cn_avg_Z))
+            alpha_j = torch.tensor([float(xi_Zl.item())], dtype=dtype, device=device)
+            c_j = torch.tensor([float(c_acp.item())], dtype=dtype, device=device)
+            block_cols = slice(col_off, col_off + nprj)
+            for ish, sh in enumerate(shells):
+                li = l_map[sh.l]
+                off_i = basis.ao_offsets[ish]
+                ni = basis.ao_counts[ish]
+                R = pos_req[sh.atom_index] - pos_req[A]
+                S_block = _ov_sph_t(li, ell, alpha_i[ish], coeff_i[ish], alpha_j, c_j, R)
+                S_acp[off_i:off_i+ni, block_cols] = S_block
+            col_off += nprj
+    # Energy and gradient
+    H_acp = S_acp @ S_acp.T
+    E = torch.einsum('ij,ji->', P.to(dtype=dtype, device=device), H_acp)
+    grad, = torch.autograd.grad(E, pos_req, create_graph=False)
+    return E.detach(), grad.detach()
+
+
+def grad_spin_energy(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    Pa: Tensor,
+    Pb: Tensor,
+    params,
+) -> Tuple[Tensor, Tensor]:
+    """Return (E^{spin}, dE^{spin}/dR) per doc/theory/17 via ∂S/∂R.
+
+    - Rebuild S with differentiable MD torch kernel.
+    - Compute shell magnetizations m_{l_A} from (Pa, Pb, S) using Mulliken-like partitioning (Eq. 119b).
+    - Evaluate E^{spin} (Eq. 120b) and differentiate w.r.t. positions.
+    - P^α and P^β are held fixed; only ∂S enters the gradient.
+    """
+    from ..hamiltonian.spin import spin_energy as _Espin, compute_shell_magnetizations as _m_shell
+    pos_req = positions.detach().clone().requires_grad_(True)
+    S = _build_S_raw_torch(numbers, pos_req, basis, coeffs_map=None)
+    m_shell = _m_shell(Pa.to(S), Pb.to(S), S, basis)
+    E = _Espin(numbers, basis, m_shell, params)
+    grad, = torch.autograd.grad(E, pos_req, create_graph=False)
+    return E.detach(), grad.detach()
+
+
 def total_gradient(
     numbers: Tensor,
     positions: Tensor,
@@ -145,6 +320,20 @@ def total_gradient(
     aes_r_cov: Tensor | None = None,
     aes_k_cn: float | None = None,
     aes_si_rules: dict | None = None,
+    # OFX onsite exchange (Eq. 155) via ∂S/∂R
+    include_ofx: bool = False,
+    ofx_params: object | None = None,  # OFXParams
+    # MFX long-range exchange (Eqs. 149, 153)
+    include_mfx: bool = False,
+    mfx_params: object | None = None,  # MFXParams
+    # ACP nonlocal correction (Eqs. 78–80)
+    include_acp: bool = False,
+    acp_params: dict | None = None,  # expects {'c0','xi','k_acp_cn','cn_avg','r_cov','k_cn','l_list'(optional)}
+    # Spin polarization (doc/theory/17)
+    include_spin: bool = False,
+    spin_params: object | None = None,  # SpinParams
+    P_alpha: Tensor | None = None,
+    P_beta: Tensor | None = None,
     # Third order
     include_third_order: bool = False,
     third_params: object | None = None,  # ThirdOrderParams
@@ -223,6 +412,35 @@ def total_gradient(
         Eaes, gaes = grad_aes_energy(numbers, positions, basis, P if P is not None else torch.zeros((basis.nao, basis.nao), dtype=dtype, device=device), aes_params, r_cov=aes_r_cov, k_cn=float(aes_k_cn), si_rules=aes_si_rules)
         dE = dE + gaes
 
+    # --- OFX ---
+    if include_ofx:
+        if P is None or ofx_params is None:
+            raise ValueError("OFX gradient requires P and ofx_params (doc/theory/21)")
+        Eofx, gofx = grad_ofx_energy(numbers, positions, basis, P, ofx_params)
+        dE = dE + gofx
+
+    # --- MFX ---
+    if include_mfx:
+        if P is None or mfx_params is None:
+            raise ValueError("MFX gradient requires P and mfx_params (doc/theory/20)")
+        Emfx, gmfx = grad_mfx_energy(numbers, positions, basis, P, mfx_params)
+        dE = dE + gmfx
+
+    # --- ACP ---
+    if include_acp:
+        if P is None or acp_params is None:
+            raise ValueError("ACP gradient requires P and acp_params (doc/theory/13)")
+        for rk in ('c0','xi','k_acp_cn','cn_avg','r_cov','k_cn'):
+            if rk not in acp_params:
+                raise ValueError(f"ACP gradient missing '{rk}' (doc/theory/13, Eq. 80)")
+        Eacp, gacp = grad_acp_energy(
+            numbers, positions, basis, P,
+            c0=acp_params['c0'], xi=acp_params['xi'], k_acp_cn=float(acp_params['k_acp_cn']),
+            cn_avg=acp_params['cn_avg'], r_cov=acp_params['r_cov'], k_cn=float(acp_params['k_cn']),
+            l_list=acp_params.get('l_list', ("s","p","d"))
+        )
+        dE = dE + gacp
+
     # --- Third-order TB (kernel-only contribution) ---
     if include_third_order:
         if third_params is None or third_q_shell is None or third_q_atom is None or third_U_shell is None:
@@ -236,5 +454,12 @@ def total_gradient(
             raise ValueError("Fourth-order gradient requires fourth_params and fourth_q (doc/theory/19 Eq. 140b)")
         _E4, g4 = grad_fourth_order_energy(numbers, positions, fourth_q.to(dtype), fourth_params)
         dE = dE + g4
+
+    # --- Spin polarization ---
+    if include_spin:
+        if spin_params is None or P_alpha is None or P_beta is None:
+            raise ValueError("Spin gradient requires spin_params, P_alpha, and P_beta (doc/theory/17)")
+        Esp, gsp = grad_spin_energy(numbers, positions, basis, P_alpha, P_beta, spin_params)
+        dE = dE + gsp
 
     return dE

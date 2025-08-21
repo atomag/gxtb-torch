@@ -64,6 +64,10 @@ class GxTBSchema:
     aes_rules: Dict[str, str] | None = None
     ofx_element: Dict[str, Tuple[int, int]] | None = None
     ofx_rules: Dict[str, str] | None = None
+    # First-order TB mapping (onsite): expects per-element μ^{(1),0}_l (l=s,p,d,f),
+    # per-element k^{(1),CN}, and global scalars kdis,kx,ks for f^{(1)} (Eq. 83b).
+    first_order: Dict[str, Tuple[int, int]] | None = None
+    first_order_global: Dict[str, Tuple[int, int]] | None = None
     # MFX mapping (educated guess). Optional sections:
     # - [mfx]: global scalars alpha, omega, k1, k2, and optionally xi_s, xi_p, xi_d, xi_f
     # - [mfx.element]: per-element shell Hubbard-like U^{MFX}_l via keys U_s, U_p, U_d, U_f
@@ -233,6 +237,23 @@ def load_schema(path: str | Path) -> GxTBSchema:
             rules = ofx["rules"]
             if isinstance(rules, dict):
                 object.__setattr__(schema, "ofx_rules", {str(k): str(v) for k, v in rules.items()})
+    # First-order TB mapping (optional; required if first-order TB is enabled)
+    if "first_order" in data and isinstance(data["first_order"], dict):
+        fo = data["first_order"]
+        emap: Dict[str, Tuple[int, int]] = {}
+        gmap: Dict[str, Tuple[int, int]] = {}
+        for k, v in fo.items():
+            if isinstance(v, list):
+                # element-wise indices for mu10_s/p/d/f and kCN1
+                emap[k] = tup(v)  # type: ignore
+        object.__setattr__(schema, "first_order", emap if emap else None)
+    if "first_order_global" in data and isinstance(data["first_order_global"], dict):
+        fog = data["first_order_global"]
+        gmap: Dict[str, Tuple[int, int]] = {}
+        for k, v in fog.items():
+            if isinstance(v, list):
+                gmap[k] = tup(v)  # type: ignore
+        object.__setattr__(schema, "first_order_global", gmap if gmap else None)
     # MFX nested tables (optional)
     if "mfx" in data and isinstance(data["mfx"], dict):
         mfx = data["mfx"]
@@ -526,6 +547,50 @@ def map_mfx_global(g: GxTBParameters, schema: GxTBSchema) -> Dict[str, torch.Ten
         # valence shells (s,p) use ξ=1; polarization (d,f) use ξ=2.
         xi = torch.tensor([1.0, 1.0, 2.0, 2.0], dtype=torch.float64)
     return {"alpha": alpha, "omega": omega, "k1": k1, "k2": k2, "xi_l": xi}
+
+
+def map_first_order_params(g: GxTBParameters, schema: GxTBSchema) -> Dict[str, torch.Tensor | float]:
+    """Map first-order TB parameters (doc/theory/14_first_order_tb.md Eqs. 83–84).
+
+    Returns dict:
+      - mu10: (Zmax+1,4) per-element μ^{(1),0}_l in order s,p,d,f
+      - kCN: (Zmax+1,) per-element k^{(1),CN}
+      - kdis, kx, ks: global scalars for f^{(1)}(q)
+
+    Raises if schema sections are missing (no hidden defaults).
+    """
+    if schema.first_order is None:
+        raise ValueError("Schema missing [first_order] element mapping (μ^{(1),0}_l, kCN) for first-order TB")
+    if schema.first_order_global is None:
+        raise ValueError("Schema missing [first_order_global] mapping (kdis,kx,ks) for first-order TB")
+    maxz = max(g.elements)
+    # Build mu10
+    mu10 = torch.zeros((maxz + 1, 4), dtype=torch.float64)
+    # Required keys for mu10 per shell and kCN per element
+    required_mu = ("mu10_s", "mu10_p", "mu10_d", "mu10_f")
+    for key in required_mu:
+        if key not in schema.first_order:
+            raise ValueError(f"Schema [first_order] missing '{key}' index")
+    if 'kCN1' not in schema.first_order:
+        raise ValueError("Schema [first_order] missing 'kCN1' index for k^{(1),CN}")
+    for z, blk in g.elements.items():
+        mu10[z, 0] = _get_line_val(blk.lines, schema.first_order['mu10_s'])
+        mu10[z, 1] = _get_line_val(blk.lines, schema.first_order['mu10_p'])
+        mu10[z, 2] = _get_line_val(blk.lines, schema.first_order['mu10_d'])
+        mu10[z, 3] = _get_line_val(blk.lines, schema.first_order['mu10_f'])
+    kCN = torch.zeros(maxz + 1, dtype=torch.float64)
+    for z, blk in g.elements.items():
+        kCN[z] = _get_line_val(blk.lines, schema.first_order['kCN1'])
+    # Globals
+    gl = g.global_lines.lines
+    def gval(name: str) -> float:
+        if name not in schema.first_order_global:
+            raise ValueError(f"Schema [first_order_global] missing '{name}' index")
+        return _get_line_val(gl, schema.first_order_global[name])
+    kdis = gval('kdis')
+    kx = gval('kx')
+    ks = gval('ks')
+    return {"mu10": mu10, "kCN": kCN, "kdis": kdis, "kx": kx, "ks": ks}
 
 
 def validate_tb_parameters(g: GxTBParameters, schema: GxTBSchema, numbers: torch.Tensor | None = None) -> None:
