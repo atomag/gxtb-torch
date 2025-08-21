@@ -350,6 +350,9 @@ def total_gradient(
     eeq: object | None = None,
     total_charge: float = 0.0,
     repulsion_dq_dpos: Tensor | None = None,
+    # Dispersion (doc/theory/22): revD4 energy + forces
+    include_dispersion: bool = False,
+    dispersion_params: dict | None = None,  # expects {'method': D4Method, 'ref': dict, 'q': Tensor or 'eeq': EEQParameters}
 ) -> Tensor:
     """Aggregate nuclear gradient contributions for currently implemented components.
 
@@ -499,5 +502,23 @@ def total_gradient(
         # This call will raise a clear error if k^q/k^{q,2} are non-zero and repulsion_dq_dpos is missing (Eq. 58)
         _E, grep = _Erep(positions, numbers, repulsion_params, q_eeqbc, dq_dpos=repulsion_dq_dpos)
         dE = dE + grep
+
+    # --- revD4 dispersion (doc/theory/22) ---
+    if include_dispersion:
+        if dispersion_params is None or 'method' not in dispersion_params or 'ref' not in dispersion_params:
+            raise ValueError("Dispersion gradient requires dispersion_params with 'method' (D4Method) and 'ref' (reference dict)")
+        from ..classical.dispersion import d4_energy_with_grad
+        method = dispersion_params['method']
+        ref = dispersion_params['ref']
+        # Charges: prefer explicit 'q'; otherwise compute via EEQ if provided
+        q_ch = dispersion_params.get('q', None)
+        if q_ch is None:
+            eeqp = dispersion_params.get('eeq', None)
+            if eeqp is None:
+                raise ValueError("Dispersion gradient requires 'q' charges or 'eeq' parameters to compute them")
+            from ..charges.eeq import compute_eeq_charges
+            q_ch = compute_eeq_charges(numbers, positions, eeqp, total_charge=0.0, device=positions.device, dtype=positions.dtype)
+        Edisp, gdisp = d4_energy_with_grad(numbers, positions, q_ch.to(positions), method, ref)
+        dE = dE + gdisp
 
     return dE
