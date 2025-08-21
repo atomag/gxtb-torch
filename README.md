@@ -23,15 +23,15 @@ For an ASE interface see `src/gxtb/ase_calc.py` (`GxTBCalculator`).
 | Second‑order TB (isotropic) | `doc/theory/15_second_order_tb.md` | `hamiltonian/second_order_tb.py`, `scf.py` | Partial | Atomic + shell paths; shell reference populations and CN used; tests expanding. |
 | Anisotropic electrostatics (AES) | `doc/theory/16_anisotropic_electrostatics.md` | `hamiltonian/aes.py`, `hamiltonian/moments_builder.py` | Partial | Multipole moments and damping implemented; integration paths guarded and optional. |
 | Spin polarization | `doc/theory/17_spin_polarization.md` | `hamiltonian/spin.py`, `scf.py` | Done | UHF spin energy and Fock add‑on; shell magnetizations. |
-| Third‑order TB (E^(3)) | `doc/theory/18_third_order_tb.md` | `hamiltonian/third_order.py`, `scf.py` | Partial | Parameter mapping and tau3 matrix present; validation ongoing. |
-| Fourth‑order TB (E^(4)) | `doc/theory/19_fourth_order_tb.md` | `hamiltonian/fourth_order.py`, `scf.py` | Partial | Onsite Fock term and energy wired; requires tuned γ4. |
+| Third‑order TB (E^(3)) | `doc/theory/18_third_order_tb.md` | `hamiltonian/third_order.py`, `scf.py` | Implemented but strange | Parameter mapping and tau3 matrix present; validation ongoing. |
+| Fourth‑order TB (E^(4)) | `doc/theory/19_fourth_order_tb.md` | `hamiltonian/fourth_order.py`, `scf.py` | Implemented but strange | Onsite Fock term and energy wired; requires tuned γ4. |
 | MFX exchange (long‑range) | `doc/theory/20_mfx.md` | `hamiltonian/mfx.py`, `scf.py` | Partial | γ^MFX AO build and hooks present; screening/validation pending. |
 | OFX exchange (onsite) | `doc/theory/21_ofx.md` | `hamiltonian/ofx.py`, `scf.py` | Done | Energy and Fock per Eqs. 155/159; Λ^0 explicit, no defaults. |
 | Atomic increments | `doc/theory/10_atomic_energy_increment.md` | `classical/increment.py` | Done | Element‑resolved constants loaded via schema. |
 | Semi‑classical repulsion | `doc/theory/11_semi_classical_repulsion.md` | `classical/repulsion.py` | Partial | Kernel implemented with CN/charge coupling; tuning/validation pending. |
 | Dispersion (revD4) | `doc/theory/22_dft_revd4.md` | `classical/dispersion.py` | Partial | Method/TOML loaders and energy path; SCF coupling off by design. |
 | SCF solver | `doc/theory/5_kohn_sham_type_equations.md` | `scf.py`, `hamiltonian/scf_adapter.py` | Partial | Löwdin orthogonalization, Mulliken, linear/Anderson/Broyden mixing, dynamic overlap; convergence heuristics in place. |
-| Nuclear gradients | `doc/theory/6_nuclear_gradients.md` | `grad/nuclear.py` | Todo | Analytic gradients pending for all terms. |
+| Nuclear gradients | `doc/theory/6_nuclear_gradients.md` | `grad/nuclear.py` | Implemented but felling off | Analytic gradients pending for all terms. |
 
 ### Periodic Boundary Conditions (PBC)
 | PBC Area | Theory ref | Module(s) | Status | Notes |
