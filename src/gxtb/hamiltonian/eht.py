@@ -385,16 +385,25 @@ def eht_energy_gradient(
                 c1i = c1v[i]; c1j = c1v[j]
                 R = positions[A] - positions[B]
                 # Contributions: dS/dq_eff(A): overlap(c1_i, c_j) if shell i on A; plus overlap(c_i, c1_j) if shell j on A
+                # Use spherical transforms computed from the physical contracted shells (ci,cj) to avoid
+                # degenerate on-center metrics when c1 vectors are zero.
+                from ..basis.md_overlap import _metric_transform_for_shell as _T_sph, _overlap_cart_block as _S_cart
+                Ti = _T_sph(l_idx[i], ai, ci)
+                Tj = _T_sph(l_idx[j], aj, cj)
                 dS_A = torch.zeros((ni, nj), dtype=dtype, device=device)
                 if atom_idx[i].item() == A:
-                    dS_A = dS_A + overlap_shell_pair(l_idx[i], l_idx[j], ai, c1i, aj, cj, R)
+                    Sc = _S_cart(l_idx[i], l_idx[j], ai, c1i, aj, cj, R)
+                    dS_A = dS_A + (Ti @ Sc @ Tj.T)
                 if atom_idx[j].item() == A:
-                    dS_A = dS_A + overlap_shell_pair(l_idx[i], l_idx[j], ai, ci, aj, c1j, R)
+                    Sc = _S_cart(l_idx[i], l_idx[j], ai, ci, aj, c1j, R)
+                    dS_A = dS_A + (Ti @ Sc @ Tj.T)
                 dS_B = torch.zeros((ni, nj), dtype=dtype, device=device)
                 if atom_idx[i].item() == B:
-                    dS_B = dS_B + overlap_shell_pair(l_idx[i], l_idx[j], ai, c1i, aj, cj, R)
+                    Sc = _S_cart(l_idx[i], l_idx[j], ai, c1i, aj, cj, R)
+                    dS_B = dS_B + (Ti @ Sc @ Tj.T)
                 if atom_idx[j].item() == B:
-                    dS_B = dS_B + overlap_shell_pair(l_idx[i], l_idx[j], ai, ci, aj, c1j, R)
+                    Sc = _S_cart(l_idx[i], l_idx[j], ai, ci, aj, c1j, R)
+                    dS_B = dS_B + (Ti @ Sc @ Tj.T)
                 # Apply diatomic scaling (Eqs. 31–32) to derivative blocks (K independent of q_eff)
                 kA_ch = k_channels_for_Z(ZA)
                 kB_ch = k_channels_for_Z(ZB)
