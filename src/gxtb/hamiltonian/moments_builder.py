@@ -11,7 +11,7 @@ Maps per-shell pair moment sub-blocks (real spherical) into full AO matrices,
 using the same spherical transforms as overlap to preserve consistency.
 """
 
-from typing import Tuple
+from typing import Tuple, List, Optional
 import torch
 from ..basis.moments import moment_shell_pair
 
@@ -20,7 +20,13 @@ Tensor = torch.Tensor
 __all__ = ["build_moment_matrices"]
 
 
-def build_moment_matrices(numbers: Tensor, positions: Tensor, basis) -> Tuple[Tensor, Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]:
+def build_moment_matrices(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    *,
+    coeff_override: Optional[List[Tensor]] = None,
+) -> Tuple[Tensor, Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]:
     """Assemble AO-level S, D, Q matrices for current geometry.
 
     Returns
@@ -51,8 +57,12 @@ def build_moment_matrices(numbers: Tensor, positions: Tensor, basis) -> Tuple[Te
     coeff_list = []
     for sh in basis.shells:
         alpha_list.append(torch.tensor([p[0] for p in sh.primitives], dtype=dtype, device=device))
-        # Static q‑vSZP baseline: c = c0 (doc/theory/7 Eq. 27 with q_eff=0)
-        coeff_list.append(torch.tensor([p[1] for p in sh.primitives], dtype=dtype, device=device))
+        if coeff_override is None:
+            # Static q‑vSZP baseline: c = c0 (doc/theory/7 Eq. 27 with q_eff=0)
+            coeff_list.append(torch.tensor([p[1] for p in sh.primitives], dtype=dtype, device=device))
+        else:
+            # Use dynamic contraction coefficients provided by caller (c0 + c1 q_eff)
+            coeff_list.append(coeff_override[len(coeff_list)].to(device=device, dtype=dtype))
     # Iterate shells
     for i, shi in enumerate(basis.shells):
         oi, ni = basis.ao_offsets[i], basis.ao_counts[i]

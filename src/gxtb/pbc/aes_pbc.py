@@ -13,14 +13,16 @@ as E_AES = 1/2 Tr(H_AES P_total) with P_total = Σ_k w_k P_k.
 Higher-order n=7/n=9 terms are not supported in this periodic path yet.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import torch
+import logging
 
 from ..hamiltonian.aes import AESParams
 from ..hamiltonian.aes import _third_derivative_tensor, _fourth_derivative_tensor
 from ..hamiltonian.aes import compute_atomic_moments as _compute_atomic_moments
 from .ewald import ewald_grad_hess_1over_r
 from .cn_pbc import coordination_number_pbc
+from .cell import build_lattice_translations
 
 Tensor = torch.Tensor
 
@@ -28,6 +30,8 @@ __all__ = [
     "periodic_aes_potentials",
     "assemble_aes_hamiltonian",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def _pair_kernels_cross(positions: Tensor, mrad: Tensor, Rvec: Tensor, dmp3: float, dmp5: float, mask_diag: bool) -> Tuple[Tensor, Tensor]:
@@ -80,6 +84,7 @@ def periodic_aes_potentials(
     ewald_eta: float,
     ewald_r_cut: float,
     ewald_g_cut: float,
+    high_order_cutoff: Optional[float] = None,
     si_rules: dict | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute periodic AES atomic potentials and energy per unit cell.
@@ -145,6 +150,54 @@ def periodic_aes_potentials(
     E = E + 0.5 * ((qAi * tr_H_ThetaB) + (qBj * tr_H_ThetaA)).sum()
     v_mono = v_mono + 0.5 * tr_H_ThetaB.sum(dim=1)
     v_quad = v_quad + 0.5 * torch.einsum('ij, ijab -> iab', qBj, Hess)
+    # Higher-order AES (n=7,9) via real-space lattice sums within cutoff
+    has7 = params.dmp7 is not None
+    has9 = params.dmp9 is not None
+    if has7 or has9:
+        # Traceless quadrupole tensor Θ_A from Q_A
+        eye3 = torch.eye(3, device=device, dtype=dtype)
+        ThetaA = QA - (QA.diagonal(dim1=-2, dim2=-1).sum(-1) / 3.0).unsqueeze(-1).unsqueeze(-1) * eye3
+        # Enumerate translations (include origin; mask A==B at origin)
+        hi_cut = float(high_order_cutoff) if high_order_cutoff is not None else float(cutoff)
+        if high_order_cutoff is None:
+            logger.debug("AES higher-order cutoff not provided; falling back to cutoff=%.3f Å", hi_cut)
+        translations = build_lattice_translations(hi_cut, cell.to(device=device, dtype=dtype))
+        logger.debug("AES higher-order translations: nR=%d (cutoff=%.3f Å)", len(translations), hi_cut)
+        for (ti, tj, tk) in translations:
+            Rvec = ti * cell[0] + tj * cell[1] + tk * cell[2]
+            pos_img = positions + Rvec
+            rij_t = positions.unsqueeze(1) - pos_img.unsqueeze(0)  # (nat,nat,3)
+            dist = torch.linalg.norm(rij_t, dim=-1)
+            eps = torch.finfo(dtype).eps
+            invR = 1.0 / torch.clamp(dist, min=eps)
+            # Mask singular origin self-pairs
+            if ti == 0 and tj == 0 and tk == 0:
+                mask = ~torch.eye(nat, dtype=torch.bool, device=device)
+                rij_t = torch.where(mask.unsqueeze(-1), rij_t, torch.zeros_like(rij_t))
+                invR = torch.where(mask, invR, torch.zeros_like(invR))
+            # Damping per-order using rr built from mrad
+            rr = 0.5 * (mrad.unsqueeze(1) + mrad.unsqueeze(0)) * invR
+            if has7:
+                fdmp7 = 1.0 / (1.0 + 6.0 * rr.pow(float(params.dmp7)))
+                T3 = _third_derivative_tensor(rij_t, invR, fdmp7)
+                if T3 is not None:
+                    # E_dq: -1/6 [ μ_B · (Θ_A:T3) + μ_A · (Θ_B:T3) ]
+                    E = E - (
+                        torch.einsum('j a, i b c, i j a b c ->', muA, ThetaA, T3)
+                        + torch.einsum('i a, j b c, i j a b c ->', muA, ThetaA, T3)
+                    ) / 6.0
+                    # v_dip(A) += -1/6 Σ_B Θ_B^{bc} T3_{a b c}
+                    v_dip = v_dip - (torch.einsum('j b c, i j a b c -> i a', ThetaA, T3)) / 6.0
+                    # v_quad(A) += -1/6 Σ_B μ_B^a T3_{a b c}
+                    v_quad = v_quad - (torch.einsum('j a, i j a b c -> i b c', muA, T3)) / 6.0
+            if has9:
+                fdmp9 = 1.0 / (1.0 + 6.0 * rr.pow(float(params.dmp9)))
+                T4 = _fourth_derivative_tensor(rij_t, invR, fdmp9)
+                if T4 is not None:
+                    # E_qq: +1/24 Θ_A^{ab} Θ_B^{cd} T4_{abcd}
+                    E = E + torch.einsum('i a b, j c d, i j a b c d ->', ThetaA, ThetaA, T4) / 24.0
+                    # v_quad(A) += +1/24 Σ_B T4_{a b c d} Θ_B^{c d}
+                    v_quad = v_quad + (torch.einsum('i j a b c d, j c d -> i a b', T4, ThetaA)) / 24.0
     return v_mono, v_dip, v_quad, E
 
 

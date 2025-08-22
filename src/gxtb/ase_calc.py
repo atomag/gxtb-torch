@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 
 import torch
+import logging
 
 try:
     from ase.calculators.calculator import Calculator, all_changes
@@ -26,7 +27,7 @@ from .params.schema import (
 from .classical.increment import energy_increment
 from .classical.repulsion import RepulsionParams, repulsion_energy
 from .cn import coordination_number
-from .basis.qvszp import build_atom_basis
+from .basis.qvszp import build_atom_basis, compute_effective_charge_pbc, build_dynamic_primitive_coeffs
 from .hamiltonian.scf_adapter import build_eht_core, make_core_builder
 from .scf import scf
 import gxtb.scf as _scf_mod
@@ -36,6 +37,7 @@ from .io.molden import write as write_molden, shells_from_qvszp, MOSet, MOWavefu
 from .basis.qvszp import compute_effective_charge
 
 EH2EV = 27.211386245988
+logger = logging.getLogger(__name__)
 
 
 class GxTBCalculator(Calculator):
@@ -74,6 +76,7 @@ class GxTBCalculator(Calculator):
         pbc_cn_cutoff: Optional[float] = None,  # cutoff for CN under PBC
         pbc_disp_cutoff: Optional[float] = None,  # cutoff for dispersion under PBC
         pbc_aes_cutoff: Optional[float] = None,  # cutoff for AES lattice sums under PBC
+        pbc_aes_high_order_cutoff: Optional[float] = None,  # optional cutoff for AES n=7/9 (falls back to pbc_aes_cutoff)
         # Ewald parameters for PBC second-order (required for scf-k)
         ewald_eta: Optional[float] = None,
         ewald_r_cut: Optional[float] = None,
@@ -149,6 +152,7 @@ class GxTBCalculator(Calculator):
         self._pbc_cn_cutoff = pbc_cn_cutoff
         self._pbc_disp_cutoff = pbc_disp_cutoff
         self._pbc_aes_cutoff = pbc_aes_cutoff
+        self._pbc_aes_high_order_cutoff = pbc_aes_high_order_cutoff
         self._ewald_eta = ewald_eta
         self._ewald_r_cut = ewald_r_cut
         self._ewald_g_cut = ewald_g_cut
@@ -284,9 +288,11 @@ class GxTBCalculator(Calculator):
                 Sks_raw = mats_raw['S_k']; Hks = mats_raw['H_k']
                 # SPD check on raw S(k)
                 min_eig = min(float(torch.linalg.eigvalsh(Sk).real.min().item()) for Sk in Sks_raw)
+                logger.debug("PBC S(k) min eigenvalue at cutoff %.3f Å: %.3e", current_cut, min_eig)
                 if not self._s_psd_adapt or min_eig >= self._s_spd_floor or current_cut >= max_cut:
                     break
                 current_cut = min(max_cut, current_cut + step)
+                logger.debug("Adapting pbc_cutoff to %.3f Å due to SPD floor %.1e", current_cut, self._s_spd_floor)
             # Strict SPD enforcement (optional): raise if S(k) remains indefinite
             if self._s_strict_spd:
                 min_eig_final = min(float(torch.linalg.eigvalsh(Sk).real.min().item()) for Sk in Sks_raw)
@@ -343,6 +349,62 @@ class GxTBCalculator(Calculator):
                     for idx, sh in enumerate(basis.shells):
                         ao_atoms_list.extend([sh.atom_index] * basis.ao_counts[idx])
                     ao_atoms = torch.tensor(ao_atoms_list, dtype=torch.long, device=self.device)
+                # Cache translations set for dynamic rebuilds
+                translations0 = blocks.get('translations')
+                if translations0 is not None:
+                    logger.debug("Caching PBC translations: nR=%d", len(translations0))
+                # Optional dynamic q-vSZP overlap under PBC SCF: rebuild S(k), H(k) each iteration
+                k_builder = None
+                if self._enable_dynamic_overlap:
+                    # EEQBC charges required for q_eff (no hidden defaults)
+                    info = getattr(atoms, "info", {}) or {}
+                    q_info = info.get("q_eeqbc", None)
+                    if q_info is None:
+                        # Attempt to compute via internal EEQ if schema mapping is provided
+                        eeq_map = getattr(self._schema, 'eeq', None)
+                        if eeq_map is None:
+                            raise ValueError("Dynamic q-vSZP under PBC requires atoms.info['q_eeqbc'] or [eeq] mapping in schema to compute EEQ charges.")
+                        from .charges.eeq import compute_eeq_charges as _compute_eeq
+                        mapping = {k: int(v) for k, v in eeq_map.items()}
+                        q_eeqbc_t = _compute_eeq(numbers.to(device=self.device), positions.to(device=self.device), self._p_eeq, 0.0, mapping=mapping, device=self.device, dtype=positions.dtype)
+                    else:
+                        q_eeqbc_t = torch.tensor(q_info, dtype=positions.dtype, device=self.device)
+                    # q-vSZP prefactors (k0..k3) from schema
+                    qv = map_qvszp_prefactors(self._p_gxtb, self._schema)
+                    k0 = qv['k0'].to(device=self.device, dtype=positions.dtype)
+                    k1 = qv['k1'].to(device=self.device, dtype=positions.dtype)
+                    k2 = qv['k2'].to(device=self.device, dtype=positions.dtype)
+                    k3 = qv['k3'].to(device=self.device, dtype=positions.dtype)
+                    r_cov = self._map_cn['r_cov'].to(device=self.device, dtype=positions.dtype)
+                    k_cn = float(self._map_cn['k_cn'])
+                    cn_cut = float(self._pbc_cn_cutoff)
+                    # Capture constants for closure
+                    # Shared tiny cache for coefficients and q_eff keyed by exact q bytes
+                    coeff_cache: dict = {'key': None, 'coeffs': None, 'qeff': None}
+                    coeff_cache_stats: dict = {'hits': 0, 'misses': 0}
+                    def _coeffs_for_q(q_current: torch.Tensor):
+                        qcur = q_current.to(dtype=positions.dtype, device=self.device).detach().cpu().numpy().tobytes()
+                        if coeff_cache['key'] == qcur and coeff_cache['coeffs'] is not None:
+                            coeff_cache_stats['hits'] += 1
+                            logger.debug("qvSZP coeff cache HIT (iteration), key_bytes=%d", len(qcur))
+                            return coeff_cache['coeffs'], coeff_cache['qeff']
+                        q_eff = compute_effective_charge_pbc(numbers, positions, q_current.to(dtype=positions.dtype, device=self.device), q_eeqbc_t,
+                                                             r_cov=r_cov, k_cn=k_cn, k0=k0, k1=k1, k2=k2, k3=k3,
+                                                             cell=cell, cn_cutoff=cn_cut)
+                        coeffs = build_dynamic_primitive_coeffs(numbers, basis, q_eff)
+                        coeff_cache['key'] = qcur
+                        coeff_cache['coeffs'] = coeffs
+                        coeff_cache['qeff'] = q_eff
+                        coeff_cache_stats['misses'] += 1
+                        logger.debug("qvSZP coeff cache MISS → build coeffs (len=%d)", len(coeffs))
+                        return coeffs, q_eff
+                    def _k_builder(q_current: torch.Tensor):
+                        # eq: doc/theory/7 Eq. (28) with PBC CN from doc/theory/25
+                        coeffs, _ = _coeffs_for_q(q_current)
+                        b = eht_lattice_blocks(numbers, positions, basis, self._p_gxtb, self._schema, cell, current_cut, float(self._pbc_cn_cutoff), coeff_override=coeffs, translations=translations0, ao_atoms_opt=ao_atoms)
+                        m = assemble_k_matrices(b['translations'], b['S_blocks_raw'], b['H_blocks'], K)
+                        return m['S_k'], m['H_k']
+                    k_builder = _k_builder
                 # Optional periodic AES builder (requires moment matrices)
                 h_extra_builder = None
                 if self._enable_aes:
@@ -364,11 +426,19 @@ class GxTBCalculator(Calculator):
                         dmp5=float(aesg['dmp5']),
                         mprad=aese['mprad'].to(device=self.device, dtype=positions.dtype),
                         mpvcn=aese['mpvcn'].to(device=self.device, dtype=positions.dtype),
+                        dmp7=float(aesg['dmp7']) if 'dmp7' in aesg else None,
+                        dmp9=float(aesg['dmp9']) if 'dmp9' in aesg else None,
                     )
                     from .hamiltonian.moments_builder import build_moment_matrices
-                    S_mono, Dm, Qm = build_moment_matrices(numbers, positions, basis)
-                    # Closure capturing periodic AES assembly from current Pk list
-                    def _build_aes_from_Pk(Pk_list: list[torch.Tensor]):
+                    # Closure capturing periodic AES assembly from current Pk list and current atomic charges q
+                    def _build_aes_from_Pk(Pk_list: list[torch.Tensor], q_current: torch.Tensor):
+                        # Determine dynamic contraction coefficients if dynamic overlap is enabled
+                        coeffs = None
+                        if self._enable_dynamic_overlap:
+                            # Reuse coefficients from the same q used for k-builder if available
+                            coeffs, _ = _coeffs_for_q(q_current)
+                        # Build AO moments with optional dynamic coefficients
+                        S_mono, Dm, Qm = build_moment_matrices(numbers, positions, basis, coeff_override=coeffs)
                         # P_total = Σ_k w_k Pk
                         P_tot = torch.zeros_like(S_mono)
                         for Pk, wk in zip(Pk_list, W):
@@ -379,6 +449,7 @@ class GxTBCalculator(Calculator):
                             r_cov=self._map_cn['r_cov'].to(device=self.device, dtype=positions.dtype),
                             k_cn=float(self._map_cn['k_cn']), cell=cell, cutoff=float(self._pbc_aes_cutoff),
                             ewald_eta=float(self._ewald_eta), ewald_r_cut=float(self._ewald_r_cut), ewald_g_cut=float(self._ewald_g_cut),
+                            high_order_cutoff=(float(self._pbc_aes_high_order_cutoff) if self._pbc_aes_high_order_cutoff is not None else None),
                             si_rules=getattr(self._schema, 'aes_rules', None),
                         )
                         H_aes = assemble_aes_hamiltonian(S_mono, Dm, Qm, ao_atoms, v_mono, v_dip, v_quad)
@@ -395,7 +466,10 @@ class GxTBCalculator(Calculator):
                 from .pbc.scf_k import scf_k as _scf_k
                 resk = _scf_k(numbers, basis, Sks_raw, Hks, ao_atoms, W.to(device=self.device, dtype=positions.dtype), nelec,
                               gamma2_atomic=gamma2, q_ref=q_ref.to(device=self.device, dtype=positions.dtype),
-                              max_iter=self._scf_max_iter, tol=self._scf_tol, mix=self._scf_mix, h_extra_builder=h_extra_builder)
+                              max_iter=self._scf_max_iter, tol=self._scf_tol, mix=self._scf_mix, h_extra_builder=h_extra_builder, k_builder=k_builder)
+                # Report dynamic caches usage (debug)
+                if self._enable_dynamic_overlap:
+                    logger.debug("qvSZP coeff cache summary: hits=%d, misses=%d", coeff_cache_stats.get('hits', 0), coeff_cache_stats.get('misses', 0))
                 E_band = resk.E_band
                 if resk.E_extra is not None:
                     E_band = E_band + resk.E_extra

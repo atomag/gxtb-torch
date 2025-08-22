@@ -65,7 +65,8 @@ def scf_k(
     max_iter: int = 50,
     tol: float = 1e-6,
     mix: float = 0.5,
-    h_extra_builder: Optional[Callable[[List[Tensor]], Tuple[List[Tensor], Tensor]]] = None,
+    h_extra_builder: Optional[Callable[[List[Tensor], Tensor], Tuple[List[Tensor], Tensor]]] = None,
+    k_builder: Optional[Callable[[Tensor], Tuple[List[Tensor], List[Tensor]]]] = None,
 ) -> SCFKResult:
     """Run a simple closed-shell SCF across k-points with atomic-level second-order."""
     nk = len(S_k)
@@ -80,20 +81,25 @@ def scf_k(
     Pk_prev: Optional[List[Tensor]] = None
     E_extra_last: Optional[Tensor] = None
     for it in range(1, max_iter + 1):
+        # Optional dynamic rebuild of k-dependent core matrices from current charges (q)
+        if k_builder is not None:
+            S_k_cur, H0_k_cur = k_builder(q)
+        else:
+            S_k_cur, H0_k_cur = S_k, H0_k
         # Potential from current Δq
         dq = (q - q_ref)
         V = gamma2_atomic @ dq
         # Assemble H_k with onsite shifts
         Hk_list: List[Tensor] = []
         for k in range(nk):
-            Hk = H0_k[k].clone()
+            Hk = H0_k_cur[k].clone()
             # Add onsite shifts: H_{μμ} += V_{atom(μ)}
             A = ao_atoms.long()
             Hk.diagonal().add_(V[A].to(dtype=Hk.dtype))
             Hk_list.append(Hk)
         # Add extra Hamiltonian (e.g., AES) from previous iteration's densities
         if h_extra_builder is not None and Pk_prev is not None:
-            H_add_list, E_extra = h_extra_builder(Pk_prev)
+            H_add_list, E_extra = h_extra_builder(Pk_prev, q)
             E_extra_last = E_extra
             for k in range(nk):
                 Hk_list[k] = Hk_list[k] + H_add_list[k].to(dtype=Hk_list[k].dtype)
@@ -101,14 +107,14 @@ def scf_k(
         Pk_list = []
         evals_list = []
         for k in range(nk):
-            Pk, ek = _density_from_orthogonal(Hk_list[k], S_k[k], nelec, spd_floor=1e-8)
+            Pk, ek = _density_from_orthogonal(Hk_list[k], S_k_cur[k], nelec, spd_floor=1e-8)
             Pk_list.append(Pk)
             evals_list.append(ek)
         Pk_prev = Pk_list
         # Mulliken charges across k
         q_new = torch.zeros_like(q)
         for k in range(nk):
-            PS = Pk_list[k] @ S_k[k].real
+            PS = Pk_list[k] @ S_k_cur[k].real
             occ = torch.diag(PS).real
             qk = torch.bincount(ao_atoms.long(), weights=occ, minlength=nat)
             q_new = q_new + K_weights[k] * qk
@@ -125,7 +131,7 @@ def scf_k(
             break
     # One final extra-H evaluation with final densities if builder provided
     if h_extra_builder is not None and Pk_prev is not None:
-        _, E_extra_final = h_extra_builder(Pk_prev)
+        _, E_extra_final = h_extra_builder(Pk_prev, q)
     else:
         E_extra_final = None
     E2 = 0.5 * torch.dot((q - q_ref), gamma2_atomic @ (q - q_ref))

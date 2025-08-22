@@ -52,6 +52,9 @@ def eht_lattice_blocks(
     cutoff: float,
     cn_cutoff: float,
     wolfsberg_mode: str = "arithmetic",
+    coeff_override: List[torch.Tensor] | None = None,
+    translations: List[Tuple[int,int,int]] | None = None,
+    ao_atoms_opt: torch.Tensor | None = None,
 ) -> Dict[str, object]:
     """Build real-space lattice blocks S(0R), H(0R) up to |R|<=cutoff for EHT first-order.
 
@@ -77,9 +80,15 @@ def eht_lattice_blocks(
     en = eht['en'] if has_en else None
     k_en = float(eht['k_en'][0].item()) if has_en else None
 
-    # Primitive exponents and static contraction coefficients (q-eff set to 0 by default)
+    # Primitive exponents and contraction coefficients
+    # eq: doc/theory/7_q-vSZP_basis_set.md (Eqs. 27–28) for c = c0 + c1*q_eff; here allow explicit override.
     alpha = [torch.tensor([p[0] for p in sh['primitives']], dtype=dtype, device=device) for sh in meta]
-    coeff = [torch.tensor([p[1] for p in sh['primitives']], dtype=dtype, device=device) for sh in meta]
+    if coeff_override is None:
+        coeff = [torch.tensor([p[1] for p in sh['primitives']], dtype=dtype, device=device) for sh in meta]
+    else:
+        if len(coeff_override) != len(meta):
+            raise ValueError("coeff_override length must match number of shells in basis")
+        coeff = [c.to(device=device, dtype=dtype) for c in coeff_override]
 
     # CN under PBC and onsite eps per AO
     cn_map = map_cn_params(gparams, schema)
@@ -95,7 +104,8 @@ def eht_lattice_blocks(
         }
 
     # Lattice translations within cutoff (include origin)
-    translations: List[Tuple[int, int, int]] = build_lattice_translations(float(cutoff), cell)
+    if translations is None:
+        translations = build_lattice_translations(float(cutoff), cell)
     S_blocks_raw: List[torch.Tensor] = []
     S_blocks_scaled: List[torch.Tensor] = []
     H_blocks: List[torch.Tensor] = []
@@ -170,7 +180,16 @@ def eht_lattice_blocks(
         S_blocks_scaled.append(S_R_scaled)
         H_blocks.append(H_R)
 
-    return {"translations": translations, "S_blocks_raw": S_blocks_raw, "S_blocks_scaled": S_blocks_scaled, "H_blocks": H_blocks}
+    # AO->atom map for downstream Mulliken charges
+    if ao_atoms_opt is not None:
+        ao_atoms = ao_atoms_opt.to(device=device)
+    else:
+        ao_atoms_list: list[int] = []
+        for ish, sh in enumerate(basis.shells):
+            ao_atoms_list.extend([sh.atom_index] * basis.ao_counts[ish])
+        ao_atoms = torch.tensor(ao_atoms_list, dtype=torch.long, device=device)
+
+    return {"translations": translations, "S_blocks_raw": S_blocks_raw, "S_blocks_scaled": S_blocks_scaled, "H_blocks": H_blocks, "ao_atoms": ao_atoms}
 
 
 def assemble_k_matrices(

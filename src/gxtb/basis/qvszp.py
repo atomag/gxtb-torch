@@ -13,6 +13,7 @@ __all__ = [
     "AtomBasis",
     "build_atom_basis",
     "compute_effective_charge",
+    "compute_effective_charge_pbc",
     "build_dynamic_primitive_coeffs",
 ]
 
@@ -102,6 +103,44 @@ def compute_effective_charge(
     if not (q_scf.shape == q_eeqbc.shape == (numbers.shape[0],)):
         raise ValueError("q_scf and q_eeqbc must have shape (nat,)")
     cn = coordination_number(positions, numbers, r_cov.to(device=device, dtype=dtype), float(k_cn))
+    Z = numbers.to(device=device, dtype=torch.long)
+    k0A = k0[Z].to(device=device, dtype=dtype)
+    k1A = k1[Z].to(device=device, dtype=dtype)
+    k2A = k2[Z].to(device=device, dtype=dtype)
+    k3A = k3[Z].to(device=device, dtype=dtype)
+    return k0A * (q_scf + k1A * q_scf * q_scf) + k2A * torch.sqrt(torch.clamp(cn, min=0.0)) + k3A * cn * q_eeqbc
+
+
+def compute_effective_charge_pbc(
+    numbers: torch.Tensor,
+    positions: torch.Tensor,
+    q_scf: torch.Tensor,
+    q_eeqbc: torch.Tensor,
+    *,
+    r_cov: torch.Tensor,
+    k_cn: float,
+    k0: torch.Tensor,
+    k1: torch.Tensor,
+    k2: torch.Tensor,
+    k3: torch.Tensor,
+    cell: torch.Tensor,
+    cn_cutoff: float,
+) -> torch.Tensor:
+    """Compute q^{eff}_A for PBC using periodic CN (doc/theory/7 Eq. 28; doc/theory/25 PBC CN).
+
+    q_eff(A) = k0_A [ q_A + k1_A q_A^2 ] + k2_A sqrt(CN_A^PBC) + k3_A CN_A^PBC q_A^{EEQBC}
+
+    - CN_A^PBC is evaluated with minimum-image periodic CN over translations within cn_cutoff.
+    - No hidden defaults: all tensors must be provided explicitly.
+
+    eq: doc/theory/7_q-vSZP_basis_set.md (Eq. 28); doc/theory/25_periodic_boundary_conditions.md (CN under PBC).
+    """
+    device = positions.device
+    dtype = positions.dtype
+    if not (q_scf.shape == q_eeqbc.shape == (numbers.shape[0],)):
+        raise ValueError("q_scf and q_eeqbc must have shape (nat,)")
+    from ..pbc.cn_pbc import coordination_number_pbc
+    cn = coordination_number_pbc(positions, numbers, r_cov.to(device=device, dtype=dtype), float(k_cn), cell.to(device=device, dtype=dtype), float(cn_cutoff))
     Z = numbers.to(device=device, dtype=torch.long)
     k0A = k0[Z].to(device=device, dtype=dtype)
     k1A = k1[Z].to(device=device, dtype=dtype)

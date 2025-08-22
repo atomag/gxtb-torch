@@ -259,7 +259,8 @@ def repulsion_energy_and_gradient(
     grad = grad + C_ABX3.sum(dim=(0, 1))
 
     # 3) Z^{eff} chain via ∂q/∂R_X (Eq. 58)
-    if ((kq[numbers.long()].abs() > 0).any() or (kq2[numbers.long()].abs() > 0).any()) and dq_dpos is None:
+    # If any active atom has non-zero kq or kq2, Eq. 58 contributes and requires dq/dR
+    if ((kq.abs() > 0).any() or (kq2.abs() > 0).any()) and dq_dpos is None:
         raise ValueError("Repulsion gradient requires dq^{EEQBC}/dR when k^q or k^{q,2} are non-zero (doc/theory/11 Eq. 58)")
     if dq_dpos is not None:
         # dZ_A/∂R_X = z0_A ( -kq_A + 2 kq2_A q_A ) dq_A/∂R_X
