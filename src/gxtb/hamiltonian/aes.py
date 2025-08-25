@@ -39,6 +39,9 @@ __all__ = [
     "AESParams",
     "compute_multipole_moments",
     "compute_atomic_moments",
+    "compute_aes_kernels",
+    "potentials_from_multipoles",
+    "assemble_fock_from_potentials",
     "aes_energy_and_fock",
     "__doc_refs__",
 ]
@@ -91,38 +94,43 @@ def compute_atomic_moments(
 ) -> Dict[str, Tensor]:
     """Per-atom Mulliken partitioning of monopole, dipole, quadrupole moments (Eq. 111a–c).
 
+    Differentiable w.r.t. matrix elements via one-hot AO→atom mapping (avoids bincount).
+
     Returns dict with keys 'q' (nat,), 'mu' (nat,3), 'Q' (nat,3,3).
     """
     device = P.device
     dtype = P.dtype
     nat = int(ao_atoms.max().item()) + 1
-    # Precompute PS-like contractions
+    nao = P.shape[0]
+    # One-hot AO→atom mapping (nao,nat)
+    Amap = torch.nn.functional.one_hot(ao_atoms.long(), num_classes=nat).to(dtype=dtype, device=device)  # (nao,nat)
+    # Precompute contractions
     PS = P @ S
     PDx = P @ D[0]
     PDy = P @ D[1]
     PDz = P @ D[2]
     PQxx = P @ Q[0]; PQxy = P @ Q[1]; PQxz = P @ Q[2]
     PQyy = P @ Q[3]; PQyz = P @ Q[4]; PQzz = P @ Q[5]
-    # Diagonals
+    # Diagonals (nao,)
     dPS = torch.diag(PS)
     dPDx = torch.diag(PDx)
     dPDy = torch.diag(PDy)
     dPDz = torch.diag(PDz)
     dQxx = torch.diag(PQxx); dQxy = torch.diag(PQxy); dQxz = torch.diag(PQxz)
     dQyy = torch.diag(PQyy); dQyz = torch.diag(PQyz); dQzz = torch.diag(PQzz)
-    # Vectorized accumulation by atom via bincount
-    qA = torch.bincount(ao_atoms.long(), weights=dPS, minlength=nat)
-    muA_x = torch.bincount(ao_atoms.long(), weights=dPDx, minlength=nat)
-    muA_y = torch.bincount(ao_atoms.long(), weights=dPDy, minlength=nat)
-    muA_z = torch.bincount(ao_atoms.long(), weights=dPDz, minlength=nat)
+    # Accumulate to atoms via (nao,nat)^T @ (nao,) = (nat,)
+    qA = Amap.T @ dPS
+    muA_x = Amap.T @ dPDx
+    muA_y = Amap.T @ dPDy
+    muA_z = Amap.T @ dPDz
     muA = torch.stack([muA_x, muA_y, muA_z], dim=-1)
     QA = torch.zeros(nat, 3, 3, dtype=dtype, device=device)
-    QA[:, 0, 0] = torch.bincount(ao_atoms.long(), weights=dQxx, minlength=nat)
-    QA[:, 0, 1] = torch.bincount(ao_atoms.long(), weights=dQxy, minlength=nat)
-    QA[:, 0, 2] = torch.bincount(ao_atoms.long(), weights=dQxz, minlength=nat)
-    QA[:, 1, 1] = torch.bincount(ao_atoms.long(), weights=dQyy, minlength=nat)
-    QA[:, 1, 2] = torch.bincount(ao_atoms.long(), weights=dQyz, minlength=nat)
-    QA[:, 2, 2] = torch.bincount(ao_atoms.long(), weights=dQzz, minlength=nat)
+    QA[:, 0, 0] = Amap.T @ dQxx
+    QA[:, 0, 1] = Amap.T @ dQxy
+    QA[:, 0, 2] = Amap.T @ dQxz
+    QA[:, 1, 1] = Amap.T @ dQyy
+    QA[:, 1, 2] = Amap.T @ dQyz
+    QA[:, 2, 2] = Amap.T @ dQzz
     # Symmetrize QA off-diagonals
     QA[:, 1, 0] = QA[:, 0, 1]
     QA[:, 2, 0] = QA[:, 0, 2]
@@ -165,13 +173,17 @@ def _pairwise_kernels(numbers: Tensor, positions: Tensor, mrad: Tensor, dmp3: fl
     nat = positions.shape[0]
     # pairwise distances and vectors
     rij = positions.unsqueeze(1) - positions.unsqueeze(0)  # (nat,nat,3)
-    dist = torch.linalg.norm(rij, dim=-1)  # (nat,nat)
+    # Squared distances and mask (avoid singularities at R=0 on diagonal)
+    mask = ~torch.eye(positions.shape[0], dtype=torch.bool, device=device)
     eps = torch.finfo(dtype).eps
-    invR = 1.0 / torch.clamp(dist, min=eps)
+    R2 = (rij * rij).sum(dim=-1)
+    invR = torch.where(mask, (R2.clamp_min(eps)).rsqrt(), torch.zeros_like(R2))
     g3 = invR * invR * invR  # eq: 110a, |∇(1/R)| factor ~ R^{-3}
     g5 = g3 * invR * invR    # eq: 110b, Hessian factor ~ R^{-5}
     # damping factors: default logistic; optional SI Eq.117 if si_params present
-    rr = 0.5 * (mrad.unsqueeze(1) + mrad.unsqueeze(0)) * invR  # (nat,nat)
+    rr_raw = 0.5 * (mrad.unsqueeze(1) + mrad.unsqueeze(0)) * invR  # (nat,nat)
+    # Avoid evaluating rr^p at rr=0 for fractional p: set diagonal rr to 1 for damping eval
+    rr = torch.where(mask, rr_raw, torch.ones_like(rr_raw))
     if si_params is None:
         fdmp3 = 1.0 / (1.0 + 6.0 * rr.pow(float(dmp3)))
         fdmp5 = 1.0 / (1.0 + 6.0 * rr.pow(float(dmp5)))
@@ -182,7 +194,7 @@ def _pairwise_kernels(numbers: Tensor, positions: Tensor, mrad: Tensor, dmp3: fl
         k5 = float(si_params.get('si_k5', 1.0))
         ks5 = float(si_params.get('si_ks5', 1.0))
         # R0 from rule: default rcov sum scaled or mrad average scaled
-        R = 1.0 / (invR + torch.finfo(dtype).eps)
+        R = torch.where(mask, 1.0 / (invR + torch.finfo(dtype).eps), torch.zeros_like(invR))
         mode = str(si_params.get('si_R0_mode', 'rcov'))
         sc = float(si_params.get('si_R0_scale', 1.0))
         if mode == 'rcov':
@@ -206,8 +218,7 @@ def _pairwise_kernels(numbers: Tensor, positions: Tensor, mrad: Tensor, dmp3: fl
     eye3 = torch.eye(3, device=device, dtype=dtype).view(1,1,3,3)
     Hess = (3.0 * rr_mat * g5.unsqueeze(-1).unsqueeze(-1) - eye3 * g3.unsqueeze(-1).unsqueeze(-1))
     Hess = Hess * fdmp5.unsqueeze(-1).unsqueeze(-1)
-    # mask diagonal
-    mask = ~torch.eye(nat, dtype=torch.bool, device=device)
+    # enforce zeros on diagonal blocks explicitly for all returned tensors
     rij = torch.where(mask.unsqueeze(-1), rij, torch.zeros_like(rij))
     f3 = torch.where(mask, f3, torch.zeros_like(f3))
     Hess = torch.where(mask.unsqueeze(-1).unsqueeze(-1), Hess, torch.zeros_like(Hess))
@@ -224,8 +235,8 @@ def _third_derivative_tensor(rij: Tensor, invR: Tensor, fdmp7: Tensor | None) ->
         return None
     device = rij.device
     dtype = rij.dtype
-    eps = torch.finfo(dtype).eps
-    R2 = 1.0 / torch.clamp(invR, min=eps) ** 2
+    # Use direct R^2 to avoid divisions by zero on diagonal; invR carries zeros on diagonal
+    R2 = (rij * rij).sum(dim=-1)
     g7 = invR ** 7
     eye = torch.eye(3, device=device, dtype=dtype)
     T = torch.zeros((*rij.shape[:-1], 3, 3, 3), dtype=dtype, device=device)
@@ -253,7 +264,8 @@ def _fourth_derivative_tensor(rij: Tensor, invR: Tensor, fdmp9: Tensor | None) -
         return None
     device = rij.device
     dtype = rij.dtype
-    R2 = (1.0 / (invR + torch.finfo(dtype).eps)) ** 2
+    # Use direct R^2 and R^4 to avoid 1/0 on diagonal
+    R2 = (rij * rij).sum(dim=-1)
     R4 = R2 * R2
     g9 = invR ** 9
     eye = torch.eye(3, device=device, dtype=dtype)
@@ -308,11 +320,24 @@ def aes_energy_and_fock(
         n_ao = basis.ao_counts[ish]
         ao_atoms.extend([basis.shells[ish].atom_index] * n_ao)
     ao_atoms_t = torch.tensor(ao_atoms, dtype=torch.long, device=device)
-    # Atomic multipoles
+    # Atomic multipoles (Mulliken). Use charge fluctuation Δq = N_valence - pop for q-based terms
     atoms = compute_atomic_moments(P, S, D, Q, ao_atoms_t)
-    qA = atoms["q"].to(device=device, dtype=dtype)
+    popA = atoms["q"].to(device=device, dtype=dtype)
     muA = atoms["mu"].to(device=device, dtype=dtype)
     QA = atoms["Q"].to(device=device, dtype=dtype)
+    # Valence electrons consistent with shells present in basis (doc/theory/3 Eq. 5 reference state)
+    # Build per-atom valence counts using the electron configuration heuristic
+    from .second_order_tb import _electron_configuration_valence_counts as _valence_map
+    nat = int(numbers.shape[0])
+    # Determine shell presence per atom
+    present = [set() for _ in range(nat)]
+    for sh in basis.shells:
+        present[sh.atom_index].add(sh.l)
+    val_counts = torch.zeros(nat, dtype=dtype, device=device)
+    for A in range(nat):
+        conf = _valence_map(int(numbers[A].item()))
+        val_counts[A] = float(sum(v for l, v in conf.items() if l in present[A]))
+    qA = val_counts - popA
     # Build damping radii (Eq. 47 CN model + AES radius generation)
     r_cov = r_cov.to(device=device, dtype=dtype)
     mrad = _build_mrad(numbers, positions, params, r_cov=r_cov, k_cn=k_cn)
@@ -361,9 +386,10 @@ def aes_energy_and_fock(
     # v_quad(A) += (1/2) q_B Hess  (matrix)
     v_quad = v_quad + 0.5 * torch.einsum('ij, ijab -> iab', qBj, Hess)
 
-    # Optional higher-order terms (Eq. 110c–d) if dmp7/dmp9 provided in AESParams
-    has7 = params.dmp7 is not None
-    has9 = params.dmp9 is not None
+    # Optional higher-order terms (Eq. 110c–d): require explicit rule enablement in si_rules
+    enable_high = bool(si_rules.get('enable_high_order', 0)) if isinstance(si_rules, dict) else False
+    has7 = enable_high and (params.dmp7 is not None)
+    has9 = enable_high and (params.dmp9 is not None)
     if has7 or has9:
         # Build traceless quadrupole tensor Θ_A from raw Q_A: Θ = Q - (Tr(Q)/3) I (Eq. 113b inspired)
         eye3 = torch.eye(3, device=device, dtype=dtype)
@@ -416,3 +442,95 @@ def aes_energy_and_fock(
     # Energy from Fock-like contribution: E = 1/2 Tr(H ∘ P)
     E_AES = 0.5 * torch.einsum('ij,ji->', H, P)
     return E_AES, H
+
+
+def compute_aes_kernels(
+    numbers: Tensor,
+    positions: Tensor,
+    params: AESParams,
+    *,
+    r_cov: Tensor,
+    k_cn: float,
+    si_rules: dict | None = None,
+) -> Dict[str, Tensor]:
+    """Precompute geometry-dependent AES kernels (doc/theory/16, Eq. 110a–b).
+
+    Returns a dict with keys:
+      - 'vec_g3': (nat,nat,3) = r_AB/R^3 with damping f_dmp3 applied
+      - 'Hess': (nat,nat,3,3) = ∇∇(1/R) with damping f_dmp5 applied
+      - 'mask': (nat,nat) boolean mask for A≠B
+      - 'mrad': (nat,) multipole damping radii
+    """
+    device = positions.device
+    dtype = positions.dtype
+    r_cov = r_cov.to(device=device, dtype=dtype)
+    mrad = _build_mrad(numbers, positions, params, r_cov=r_cov, k_cn=k_cn)
+    rij, f3, Hess, mask = _pairwise_kernels(numbers, positions, mrad, params.dmp3, params.dmp5, si_params=si_rules, r_cov=r_cov)
+    vec_g3 = rij * f3.unsqueeze(-1)
+    return {"vec_g3": vec_g3, "Hess": Hess, "mask": mask, "mrad": mrad}
+
+
+def potentials_from_multipoles(
+    qA: Tensor,
+    muA: Tensor,
+    QA: Tensor,
+    kernels: Dict[str, Tensor],
+    *,
+    params: AESParams | None = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Compute atomic potentials (v_mono, v_dip, v_quad) from atomic multipoles.
+
+    Formulas mirror the internal assembly in aes_energy_and_fock (up to n=5) so
+    that mixing in potential space matches the density-driven potentials.
+    """
+    vec_g3 = kernels["vec_g3"]
+    Hess = kernels["Hess"]
+    device = qA.device
+    dtype = qA.dtype
+    nat = qA.shape[0]
+    # Broadcast helpers
+    qAi = qA.unsqueeze(1)
+    qBj = qA.unsqueeze(0)
+    muAi = muA.unsqueeze(1)
+    muBj = muA.unsqueeze(0)
+    # v_mono(A) = - Σ_B μ_B·(r/R^3) + (1/2) Tr(Θ_B Hess)
+    v_mono = -(muBj * vec_g3).sum(-1).sum(dim=1)
+    tr_H_ThetaB = torch.einsum('ijab, j ab -> ij', Hess, QA)
+    v_mono = v_mono + 0.5 * tr_H_ThetaB.sum(dim=1)
+    # v_dip(A) = - Σ_B q_B (r/R^3) + Σ_B Hess · μ_B
+    H_muB = torch.einsum('ijab, j b -> ija', Hess, muA)
+    v_dip = -(qBj.unsqueeze(-1) * vec_g3).sum(dim=1) + H_muB.sum(dim=1)
+    # v_quad(A) = (1/2) Σ_B q_B Hess  (matrix)
+    v_quad = 0.5 * torch.einsum('ij, ijab -> iab', qBj, Hess)
+    # Optional n=7/9 contributions can be included here in the future to match aes_energy_and_fock
+    return v_mono, v_dip, v_quad
+
+
+def assemble_fock_from_potentials(
+    ao_atoms: Tensor,
+    S: Tensor,
+    D: Tuple[Tensor, Tensor, Tensor],
+    Q: Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    v_mono: Tensor,
+    v_dip: Tensor,
+    v_quad: Tensor,
+) -> Tensor:
+    """Map atomic potentials to AO-level AES Fock contribution (Eq. 109).
+
+    H_AES = -0.5 [ S ∘ (v_A+v_B) + Σ_α D^α ∘ (v^α_A+v^α_B) + Σ_{αβ} Q^{αβ} ∘ (v^{αβ}_A+v^{αβ}_B) ]
+    """
+    device = S.device
+    dtype = S.dtype
+    va = v_mono[ao_atoms]
+    VA = va.unsqueeze(1); VB = va.unsqueeze(0)
+    H = -0.5 * S * (VA + VB)
+    for comp, M in enumerate(D):
+        w = v_dip[:, comp][ao_atoms]
+        WA = w.unsqueeze(1); WB = w.unsqueeze(0)
+        H = H - 0.5 * M * (WA + WB)
+    comps = [ (0,0), (0,1), (0,2), (1,1), (1,2), (2,2) ]
+    for (a,b), M in zip(comps, Q):
+        w = v_quad[:, a, b][ao_atoms]
+        WA = w.unsqueeze(1); WB = w.unsqueeze(0)
+        H = H - 0.5 * M * (WA + WB)
+    return H

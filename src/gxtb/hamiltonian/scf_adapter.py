@@ -15,16 +15,18 @@ from typing import Dict, Callable
 import torch
 from .eht import build_eht_hamiltonian
 from ..params.loader import GxTBParameters
-from ..params.schema import GxTBSchema, map_cn_params
+from ..params.schema import GxTBSchema, map_cn_params, map_eht_params
 from .overlap_tb import build_scaled_overlap_dynamic
 from ..basis.qvszp import AtomBasis
 
 
 def build_eht_core(numbers: torch.Tensor, positions: torch.Tensor, basis: AtomBasis, gparams: GxTBParameters, schema: GxTBSchema, wolfsberg_mode: str = "arithmetic") -> Dict[str, torch.Tensor]:
+    # Precompute CN and EHT parameter maps once for this core build to avoid repeated schema lookups
     cn_map = map_cn_params(gparams, schema) if schema.cn else None
     r_cov = cn_map['r_cov'] if cn_map else None
     k_cn = cn_map['k_cn'] if cn_map else None
-    res = build_eht_hamiltonian(numbers, positions, basis, gparams, schema, r_cov=r_cov, k_cn=k_cn, wolfsberg_mode=wolfsberg_mode)
+    eht_map = map_eht_params(gparams, schema)
+    res = build_eht_hamiltonian(numbers, positions, basis, gparams, schema, r_cov=r_cov, k_cn=k_cn, eht_params=eht_map, wolfsberg_mode=wolfsberg_mode)
     ao_atoms: list[int] = []
     for idx, sh in enumerate(basis.shells):
         offs = basis.ao_offsets[idx]
@@ -37,6 +39,11 @@ def build_eht_core(numbers: torch.Tensor, positions: torch.Tensor, basis: AtomBa
 
 def make_core_builder(basis: AtomBasis, gparams: GxTBParameters, schema: GxTBSchema, wolfsberg_mode: str = "arithmetic") -> Callable[[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
     """Return closure building core Hamiltonian with chosen wolfsberg_mode ('arithmetic' or 'geometric')."""
+    # Pre-map CN and EHT parameters once for reuse across SCF iterations
+    cn_map = map_cn_params(gparams, schema)
+    r_cov = cn_map['r_cov']
+    k_cn = cn_map['k_cn']
+    eht_map = map_eht_params(gparams, schema)
     def _builder(numbers: torch.Tensor, positions: torch.Tensor, ctx: Dict[str, torch.Tensor]):
         # Optional: allow SCF to override S via dynamic q‑vSZP coefficients or explicit S
         S_raw_override = ctx.get('S_raw', None)
@@ -45,10 +52,10 @@ def make_core_builder(basis: AtomBasis, gparams: GxTBParameters, schema: GxTBSch
             # Build S^{sc} from dynamic primitive coefficients (doc/theory/7 Eq. 27 + Eqs. 31–32)
             coeffs = ctx['coeffs']  # mapping idx->tensor
             S_scaled_override = build_scaled_overlap_dynamic(numbers, positions, basis, coeffs, gparams, schema)
-        cn_map = map_cn_params(gparams, schema)
+        # Reuse precomputed CN and EHT maps (pure parameter lookups, geometry-independent)
         res = build_eht_hamiltonian(
             numbers, positions, basis, gparams, schema,
-            r_cov=cn_map['r_cov'], k_cn=cn_map['k_cn'], wolfsberg_mode=wolfsberg_mode,
+            r_cov=r_cov, k_cn=k_cn, eht_params=eht_map, wolfsberg_mode=wolfsberg_mode,
             S_raw_override=S_raw_override, S_scaled_override=S_scaled_override,
         )
         # Build AO->atom map (consistent with build_eht_core)

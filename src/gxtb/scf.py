@@ -11,6 +11,7 @@ Features:
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
+import logging
 import torch
 from .cn import coordination_number
 from .params.schema import map_cn_params
@@ -23,6 +24,8 @@ __all__ = [
     "mulliken_charges",
     "scf",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -117,7 +120,7 @@ def scf(
     max_iter: int = 50,
     tol: float = 1e-6,
     mix: float = 0.5,
-    mixing: Optional[Dict[str, object]] = None,  # {'scheme':'linear'|'anderson','beta':float,'history':int}
+    mixing: Optional[Dict[str, object]] = None,  # {'scheme':'linear'|'anderson'|'broyden','beta':float,'history':int,'beta_init':float,'anderson_soft_start':bool,'anderson_diag_offset':float}
     etol: float | None = None,
     q_rms_tol: float | None = None,
     eeq_charges: Optional[Tensor] = None,
@@ -141,6 +144,8 @@ def scf(
     # AES anisotropic electrostatics controls (doc/theory/16, Eqs. 109–111, 110a–b)
     aes: bool = False,
     aes_params: Optional[Dict[str, object]] = None,  # expects {'params': AESParams, 'r_cov': Tensor, 'k_cn': float}
+    # SCF mixing variable mode (mirror dxtb SCP mode): 'charge' or 'potential'
+    scp_mode: str = 'charge',
     # OFX onsite exchange correction (doc/theory/21, Eqs. 155,159)
     ofx: bool = False,
     ofx_params: Optional[Dict[str, object]] = None,  # expects {'alpha': float, 'Lambda0_ao': Tensor}
@@ -160,6 +165,8 @@ def scf(
     # Parameter mapping sources (optional): provide to enable schema-driven first-order mapping
     gparams: object | None = None,
     schema: object | None = None,
+    # Logging: optional cycle counter to distinguish repeated SCF runs (e.g., FD forces)
+    log_cycle: Optional[int] = None,
 ) -> SCFResult:
     """Iterative SCF updating Hubbard onsite shifts until Mulliken charges converge."""
     nao = S.shape[0]
@@ -340,6 +347,7 @@ def scf(
     aes_param_obj = None
     aes_r_cov = None
     aes_k_cn = None
+    aes_kernels = None
     if aes:
         if aes_params is None or 'params' not in aes_params or 'r_cov' not in aes_params or 'k_cn' not in aes_params:
             raise ValueError("aes=True requires aes_params with {'params': AESParams, 'r_cov': Tensor, 'k_cn': float}")
@@ -349,6 +357,11 @@ def scf(
         aes_r_cov = aes_params['r_cov'].to(S.device, dtype=S.dtype)
         aes_k_cn = float(aes_params['k_cn'])
         use_aes = True
+        # Optional potential mixing: precompute geometry-dependent kernels (Eq. 110a–b)
+        if str(scp_mode).lower() == 'potential':
+            from .hamiltonian.aes import compute_aes_kernels
+            aes_kernels = compute_aes_kernels(numbers, positions, aes_param_obj, r_cov=aes_r_cov, k_cn=aes_k_cn,
+                                             si_rules=aes_params.get('si_rules', None) if aes_params is not None else None)
     # OFX setup
     use_ofx = False
     ofx_param_obj = None
@@ -421,6 +434,9 @@ def scf(
     scheme = 'linear'
     beta = mix
     hist = 5
+    beta_init = mix
+    anderson_soft_start = False
+    anderson_diag_offset = 0.0
     # Adaptive damping knobs (no silent defaults: overridable via mixing dict)
     beta_min = 0.05
     beta_max = 0.8
@@ -430,6 +446,9 @@ def scf(
         scheme = str(mixing.get('scheme', 'linear')).lower()
         beta = float(mixing.get('beta', mix))
         hist = int(mixing.get('history', 5))
+        beta_init = float(mixing.get('beta_init', beta))
+        anderson_soft_start = bool(mixing.get('anderson_soft_start', anderson_soft_start))
+        anderson_diag_offset = float(mixing.get('anderson_diag_offset', anderson_diag_offset))
         beta_min = float(mixing.get('beta_min', beta_min))
         beta_max = float(mixing.get('beta_max', beta_max))
         beta_decay = float(mixing.get('beta_decay', beta_decay))
@@ -445,22 +464,29 @@ def scf(
               q_{k+1} = q_k + β r_k - ΔX c
         All operations are torch-native and deterministic. Fallback to linear if history is singular.
         """
-        def __init__(self, n: int, scheme: str, beta: float, hist: int):
+        def __init__(self, n: int, scheme: str, beta: float, hist: int, *, beta_init: float = None, anderson_soft_start: bool = False, anderson_diag_offset: float = 0.0):
             self.scheme = scheme
             self.beta = beta
             self.hist = max(1, int(hist))
             self.f_hist: list[Tensor] = []  # residual history r_i
             self.x_hist: list[Tensor] = []  # iterate history q_i
+            self.step: int = 0
+            self.beta_init = float(beta if beta_init is None else beta_init)
+            self.anderson_soft_start = bool(anderson_soft_start)
+            self.anderson_diag_offset = float(anderson_diag_offset)
 
         def update(self, q_current: Tensor, q_mulliken: Tensor) -> Tensor:
             if self.scheme not in ('anderson', 'broyden'):
+                self.step += 1
                 return (1.0 - self.beta) * q_current + self.beta * q_mulliken
             r = (q_mulliken - q_current).detach().clone()
             x = q_current.detach().clone()
             self.f_hist.append(r)
             self.x_hist.append(x)
-            if len(self.f_hist) < 2:
-                return q_current + self.beta * r
+            self.step += 1
+            # Soft start or insufficient history: simple step with beta_init
+            if len(self.f_hist) < 2 or (self.anderson_soft_start and self.step <= self.hist):
+                return q_current + self.beta_init * r
             k = min(self.hist, len(self.f_hist) - 1)
             # Build ΔR and ΔX with the last k steps
             dR_cols = []
@@ -470,9 +496,15 @@ def scf(
                 dX_cols.append((self.x_hist[i] - self.x_hist[i - 1]).unsqueeze(1))
             dR = torch.cat(dR_cols, dim=1)
             dX = torch.cat(dX_cols, dim=1)
-            # Solve least-squares for coefficients c: ΔR c ≈ r
+            # Solve regularized normal equations for coefficients c: (ΔR^T ΔR + δ^2 I) c = ΔR^T r
             try:
-                c = torch.linalg.lstsq(dR, r).solution
+                if self.anderson_diag_offset > 0.0:
+                    A = dR.T @ dR
+                    A = A + (self.anderson_diag_offset ** 2) * torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+                    b = dR.T @ r
+                    c = torch.linalg.solve(A, b)
+                else:
+                    c = torch.linalg.lstsq(dR, r).solution
                 if self.scheme == 'anderson':
                     correction = (dX + self.beta * dR) @ c
                 else:  # broyden (good)
@@ -483,7 +515,7 @@ def scf(
                 # Singular or ill-conditioned history; fallback to linear step
                 return (1.0 - self.beta) * q_current + self.beta * q_mulliken
 
-    mixer = _Mixer(len(numbers), scheme, beta, hist)
+    mixer = _Mixer(len(numbers), scheme, beta, hist, beta_init=beta_init, anderson_soft_start=anderson_soft_start, anderson_diag_offset=anderson_diag_offset)
 
     def mix_update(q_current: Tensor, q_mulliken: Tensor) -> Tensor:
         return mixer.update(q_current, q_mulliken)
@@ -535,14 +567,33 @@ def scf(
         rcv = pack['r_cov']
         if not isinstance(rcv, torch.Tensor) or rcv.dim() != 1 or rcv.shape[0] <= maxz:
             raise ValueError("qvszp_params['r_cov'] must be a 1D tensor with per-element covalent radii covering all Z")
-        # Allow zeros; CN code clamps denominators internally. Require non-negative and finite.
-        if not torch.isfinite(rcv).all() or (rcv < 0).any():
-            raise ValueError("qvszp_params['r_cov'] must be finite and non-negative")
+        # Allow zeros; CN code clamps denominators internally. Require non-negative and finite
+        # for the active elements present in 'numbers' (no global requirement).
+        if not torch.isfinite(rcv).all():
+            raise ValueError("qvszp_params['r_cov'] contains non-finite entries")
+        rcv_active = rcv[numbers.long()]
+        if (rcv_active < 0).any():
+            raise ValueError("qvszp_params['r_cov'] must be non-negative for active elements")
         kcn = float(pack['k_cn'])
         if not (kcn > 0):
             raise ValueError("qvszp_params['k_cn'] must be positive")
 
     last_dq_rms = None
+    # Precompute static core and orthogonalizer when dynamic overlap is disabled
+    H0_fixed: Tensor | None = None
+    S_spd_fixed: Tensor | None = None
+    X_fixed: Tensor | None = None
+    if not dynamic_overlap:
+        # Build core once and reuse across iterations; use provided S as override to avoid rebuild discrepancies
+        core0 = build_h_core(numbers, positions, {"S_raw": S})
+        H0_fixed = core0["H0"].clone()
+        # Use provided S for SPD projection to avoid rebuilding overlap here
+        Ssym0 = 0.5 * (S + S.T)
+        # Robust SPD projection using robust symmetric eigensolver with ridge fallback
+        evals0, evecs0 = robust_eigh_sym(Ssym0)
+        evals0c = torch.clamp(evals0, min=float(spd_floor))
+        S_spd_fixed = (evecs0 * evals0c) @ evecs0.T
+        X_fixed = (evecs0 * evals0c.rsqrt()) @ evecs0.T
     for it in range(1, max_iter + 1):
         # Rebuild S and H0 if q‑vSZP dynamic overlap is enabled (Eq. 27–28 + Eqs. 31–32)
         ctx: Dict[str, Tensor] = {"q": q}
@@ -570,19 +621,25 @@ def scf(
             coeffs_map: Dict[int, Tensor] = {i: c for i, c in enumerate(coeff_list)}
             # Provide dynamic coefficients to core builder; it will compute S^{sc} consistently and return it
             ctx["coeffs"] = coeffs_map  # type: ignore[assignment]
-        core = build_h_core(numbers, positions, ctx)
-        H0 = core["H0"]
-        # Prefer raw S for orthogonalization per doc/theory/5; builder may return both
-        if 'S_raw' in core:
-            S_current = core['S_raw']
-        # Robust SPD projection for S before Löwdin/Mulliken to ensure numerical stability
-        # Project S to symmetric positive-definite: S_spd = V diag(max(eig, spd_floor)) V^T
-        Ssym = 0.5 * (S_current + S_current.T)
-        evals, evecs = torch.linalg.eigh(Ssym)
-        evals_clamped = torch.clamp(evals, min=float(spd_floor))
-        S_current = (evecs * evals_clamped) @ evecs.T
-        # Löwdin orthogonalization X = S^{-1/2} (doc/theory/5, Eq. 12 context)
-        X = (evecs * evals_clamped.rsqrt()) @ evecs.T
+        if dynamic_overlap:
+            core = build_h_core(numbers, positions, ctx)
+            H0 = core["H0"]
+            # Prefer raw S for orthogonalization per doc/theory/5; builder may return both
+            if 'S_raw' in core:
+                S_current = core['S_raw']
+            # Robust SPD projection for S before Löwdin/Mulliken to ensure numerical stability
+            Ssym = 0.5 * (S_current + S_current.T)
+            evals, evecs = torch.linalg.eigh(Ssym)
+            evals_clamped = torch.clamp(evals, min=float(spd_floor))
+            S_current = (evecs * evals_clamped) @ evecs.T
+            # Löwdin orthogonalization X = S^{-1/2}
+            X = (evecs * evals_clamped.rsqrt()) @ evecs.T
+        else:
+            # Reuse precomputed core and orthogonalizer
+            assert H0_fixed is not None and S_spd_fixed is not None and X_fixed is not None
+            H0 = H0_fixed
+            S_current = S_spd_fixed
+            X = X_fixed
         # Start from EHT core
         H = H0.clone()
         # Hubbard-like onsite diagonal shift approximation for charge coupling.
@@ -690,15 +747,34 @@ def scf(
             H = H + F_off
             E1TB_current = (E1TB_current if E1TB_current is not None else 0.0) + E_off
 
-        # AES Fock update before diagonalization (Eq. 109 with 110a–b)
+        # AES contribution: either density-driven (default) or potential SCP mode
         E_AES_current = None
         if use_aes and S_mono is not None and Dm is not None and Qm is not None:
-            from .hamiltonian.aes import aes_energy_and_fock  # eq: 109,110a,110b,111
-            E_AES_current, H_AES = aes_energy_and_fock(
-                numbers, positions, basis, P, S_mono, Dm, Qm, aes_param_obj, r_cov=aes_r_cov, k_cn=aes_k_cn,
-                si_rules=aes_params.get('si_rules', None) if aes_params is not None else None
-            )
-            H = H + H_AES
+            if aes_kernels is None or str(scp_mode).lower() != 'potential':
+                # Standard density-driven AES update (Eq. 109 with 110a–b using current P)
+                from .hamiltonian.aes import aes_energy_and_fock  # eq: 109,110a,110b,111
+                E_AES_current, H_AES = aes_energy_and_fock(
+                    numbers, positions, basis, P, S_mono, Dm, Qm, aes_param_obj, r_cov=aes_r_cov, k_cn=aes_k_cn,
+                    si_rules=aes_params.get('si_rules', None) if aes_params is not None else None
+                )
+                H = H + H_AES
+            else:
+                # Potential SCP mode: add H from current potentials; update potentials after diagonalization
+                if 'aes_potentials' not in locals():
+                    # Initialize zero potentials for first iteration (deterministic seed)
+                    nat = len(numbers)
+                    v_mono = torch.zeros(nat, dtype=S.dtype, device=S.device)
+                    v_dip = torch.zeros(nat, 3, dtype=S.dtype, device=S.device)
+                    v_quad = torch.zeros(nat, 3, 3, dtype=S.dtype, device=S.device)
+                    aes_potentials = (v_mono, v_dip, v_quad)
+                from .hamiltonian.aes import assemble_fock_from_potentials
+                ao_atoms_list = []
+                for ish, off in enumerate(basis.ao_offsets):
+                    n_ao = basis.ao_counts[ish]
+                    ao_atoms_list.extend([basis.shells[ish].atom_index] * n_ao)
+                ao_atoms_t = torch.tensor(ao_atoms_list, dtype=torch.long, device=S.device)
+                H_AES = assemble_fock_from_potentials(ao_atoms_t, S_current, Dm, Qm, *aes_potentials)
+                H = H + H_AES
         # OFX Fock update using current P (Eq. 159); energy per Eq. 155
         E_OFX_current = None
         if use_ofx and ofx_param_obj is not None:
@@ -797,7 +873,59 @@ def scf(
                 m_shell_prev = compute_shell_magnetizations(P_a, P_b, S, basis)
         # Charge fluctuations Δq = N_valence - N_Mulliken (doc/theory/3, Eq. 5)
         q_mull = valence_e - mulliken_charges(P_new, S_current, ao_atoms)
-        q = mix_update(q, q_mull)
+        if use_aes and aes_kernels is not None and str(scp_mode).lower() == 'potential':
+            # In potential SCP mode, do not mix charges; they are derived from current density
+            q = q_mull
+        else:
+            q = mix_update(q, q_mull)
+        # Update AES potentials in potential SCP mode from new density multipoles
+        if use_aes and aes_kernels is not None and str(scp_mode).lower() == 'potential':
+            from .hamiltonian.aes import compute_atomic_moments, potentials_from_multipoles
+            # AO→atom mapping for moments
+            if 'ao_atoms_t' not in locals():
+                ao_atoms_list2 = []
+                for ish, off in enumerate(basis.ao_offsets):
+                    n_ao = basis.ao_counts[ish]
+                    ao_atoms_list2.extend([basis.shells[ish].atom_index] * n_ao)
+                ao_atoms_t2 = torch.tensor(ao_atoms_list2, dtype=torch.long, device=S.device)
+            else:
+                ao_atoms_t2 = ao_atoms_t
+            atoms_mp = compute_atomic_moments(P_new, S_current, Dm, Qm, ao_atoms_t2)
+            # Use Δq = N_valence - pop for q-dependent AES potentials
+            popA = atoms_mp['q']
+            dqA = (valence_e.to(dtype=popA.dtype, device=popA.device)) - popA
+            v_mono_new, v_dip_new, v_quad_new = potentials_from_multipoles(dqA, atoms_mp['mu'], atoms_mp['Q'], aes_kernels, params=aes_param_obj)
+            # Mixing in potential space (flatten → mix → unflatten)
+            def _flatten_vm(v0: Tensor, v1: Tensor, v2: Tensor) -> Tensor:
+                nat = v0.shape[0]
+                # use 6 unique quad components order (xx,xy,xz,yy,yz,zz)
+                vq = torch.stack([v2[:,0,0], v2[:,0,1], v2[:,0,2], v2[:,1,1], v2[:,1,2], v2[:,2,2]], dim=-1)
+                return torch.cat([v0, v1.reshape(nat*3), vq.reshape(nat*6)])
+            def _unflatten_vm(vec: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+                nat = len(numbers)
+                v0 = vec[:nat]
+                v1 = vec[nat:nat+3*nat].reshape(nat, 3)
+                vq = vec[nat+3*nat:].reshape(nat, 6)
+                v2 = torch.zeros(nat, 3, 3, dtype=S.dtype, device=S.device)
+                v2[:, 0, 0] = vq[:, 0]; v2[:, 0, 1] = vq[:, 1]; v2[:, 0, 2] = vq[:, 2]
+                v2[:, 1, 0] = v2[:, 0, 1]; v2[:, 2, 0] = v2[:, 0, 2]
+                v2[:, 1, 1] = vq[:, 3]; v2[:, 1, 2] = vq[:, 4]; v2[:, 2, 1] = v2[:, 1, 2]
+                v2[:, 2, 2] = vq[:, 5]
+                return v0, v1, v2
+            x_cur = _flatten_vm(*aes_potentials)
+            x_new = _flatten_vm(v_mono_new.to(x_cur.dtype), v_dip_new.to(x_cur.dtype), v_quad_new.to(x_cur.dtype))
+            x_mix = mix_update(x_cur, x_new)
+            aes_potentials = _unflatten_vm(x_mix)
+            # Recompute H_AES for energy bookkeeping with current P
+            from .hamiltonian.aes import assemble_fock_from_potentials
+            if 'ao_atoms_t' not in locals():
+                ao_atoms_list = []
+                for ish, off in enumerate(basis.ao_offsets):
+                    n_ao = basis.ao_counts[ish]
+                    ao_atoms_list.extend([basis.shells[ish].atom_index] * n_ao)
+                ao_atoms_t = torch.tensor(ao_atoms_list, dtype=torch.long, device=S.device)
+            H_AES_now = assemble_fock_from_potentials(ao_atoms_t, S_current, Dm, Qm, *aes_potentials)
+            E_AES_current = 0.5 * torch.einsum('ij,ji->', P_new, H_AES_now)
         # Update shell charges for next iteration (after density update)
         if shell_mode and shell_params_obj is not None and ref_shell_pops is not None:
             from .hamiltonian.second_order_tb import compute_shell_charges
@@ -840,7 +968,29 @@ def scf(
         # Convergence checks (default: charge sup-norm; optional energy and RMS)
         e_val = float(E_el.item())
         E_history.append(e_val)
-        dq = q - q_prev
+        dq = q - q_prev if not (use_aes and aes_kernels is not None and str(scp_mode).lower() == 'potential') else (x_mix - x_cur)
+        # Logging: per-iteration SCF diagnostics (energy and charge changes)
+        try:
+            dq_inf = float(torch.max(torch.abs(dq)).item())
+        except Exception:
+            dq_inf = float('nan')
+        try:
+            dq_rms_val = float(torch.sqrt(torch.mean(dq * dq)).item())
+        except Exception:
+            dq_rms_val = float('nan')
+        try:
+            if log_cycle is not None:
+                logger.info(
+                    "SCF #%03d iter %02d: E_el=%.8f max|dq|=%.3e rms|dq|=%.3e beta=%.3f",
+                    int(log_cycle), it, e_val, dq_inf, dq_rms_val, float(beta)
+                )
+            else:
+                logger.info(
+                    "SCF iter %02d: E_el=%.8f max|dq|=%.3e rms|dq|=%.3e beta=%.3f",
+                    it, e_val, dq_inf, dq_rms_val, float(beta)
+                )
+        except Exception:
+            pass
         cond = torch.max(torch.abs(dq)) < tol
         if q_rms_tol is not None:
             dq_rms = torch.sqrt(torch.mean(dq * dq))

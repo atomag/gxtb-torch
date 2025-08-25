@@ -67,8 +67,9 @@ def grad_aes_energy(
     damping per either logistic (default) or SI Eq. 117 when si_rules are supplied.
     """
     pos_req = positions.detach().clone().requires_grad_(True)
-    # Rebuild AO moments for current geometry
-    S, D, Q = build_moment_matrices(numbers, pos_req, basis)
+    # Rebuild AO moments for current geometry (autograd-friendly torch kernel)
+    from ..hamiltonian.moments_builder import build_moment_matrices_torch
+    S, D, Q = build_moment_matrices_torch(numbers, pos_req, basis)
     E, _H = aes_energy_and_fock(
         numbers, pos_req, basis, P, S, D, Q, params, r_cov=r_cov, k_cn=k_cn, si_rules=si_rules
     )

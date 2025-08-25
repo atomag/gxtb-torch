@@ -169,3 +169,120 @@ def moment_shell_pair(
     def sph(M: Tensor) -> Tensor:
         return Ti @ M @ Tj.T
     return sph(Dx), sph(Dy), sph(Dz), sph(Qxx), sph(Qxy), sph(Qxz), sph(Qyy), sph(Qyz), sph(Qzz)
+
+
+def _f1_torch(PA: torch.Tensor, i: int, j: int, inv2g: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
+    """Torch first-moment 1D integral 〈i | x | j〉 (autograd-friendly)."""
+    dtype = PA.dtype; device = PA.device
+    term = PA * S[i, j]
+    if i > 0:
+        term = term + i * inv2g * S[i - 1, j]
+    if j > 0:
+        term = term + j * inv2g * S[i, j - 1]
+    return term
+
+
+def _g2_torch(PA: torch.Tensor, i: int, j: int, inv2g: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
+    """Torch second moment 1D integral 〈i | x^2 | j〉 (autograd-friendly)."""
+    dtype = PA.dtype; device = PA.device
+    invg = 2.0 * inv2g
+    inv4g2 = inv2g * inv2g
+    inv2g2 = 2.0 * inv4g2
+    val = (PA * PA + inv2g) * S[i, j]
+    if i > 0:
+        val = val + (i * PA * invg) * S[i - 1, j]
+    if j > 0:
+        val = val + (j * PA * invg) * S[i, j - 1]
+    if i > 1:
+        val = val + (i * (i - 1) * inv4g2) * S[i - 2, j]
+    if j > 1:
+        val = val + (j * (j - 1) * inv4g2) * S[i, j - 2]
+    if i > 0 and j > 0:
+        val = val + (i * j * inv2g2) * S[i - 1, j - 1]
+    return val
+
+
+def moment_shell_pair_torch(
+    l_i: int,
+    l_j: int,
+    alpha_i: torch.Tensor,
+    c_i: torch.Tensor,
+    alpha_j: torch.Tensor,
+    c_j: torch.Tensor,
+    R: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd-friendly real-spherical moment blocks for a shell pair (Eq. 111b–c).
+
+    Uses torch Hermite recurrences from md_overlap._one_d_recur_torch and the same
+    metric-orthonormal spherical transforms as overlap.
+    """
+    from .md_overlap import _cart_list, _metric_transform_for_shell, _one_d_recur_torch
+    cart_i = _cart_list(l_i)
+    cart_j = _cart_list(l_j)
+    nci, ncj = len(cart_i), len(cart_j)
+    dev = alpha_i.device; dtype = alpha_i.dtype
+    Dx = torch.zeros((nci, ncj), dtype=dtype, device=dev)
+    Dy = torch.zeros_like(Dx)
+    Dz = torch.zeros_like(Dx)
+    Qxx = torch.zeros_like(Dx)
+    Qxy = torch.zeros_like(Dx)
+    Qxz = torch.zeros_like(Dx)
+    Qyy = torch.zeros_like(Dx)
+    Qyz = torch.zeros_like(Dx)
+    Qzz = torch.zeros_like(Dx)
+    # Components
+    Rx, Ry, Rz = R[0], R[1], R[2]
+    # Precompute 1D extents
+    max_ix = max(ci[0] for ci in cart_i); max_jx = max(cj[0] for cj in cart_j)
+    max_iy = max(ci[1] for ci in cart_i); max_jy = max(cj[1] for cj in cart_j)
+    max_iz = max(ci[2] for ci in cart_i); max_jz = max(cj[2] for cj in cart_j)
+    for ip in range(alpha_i.shape[0]):
+        a = alpha_i[ip]
+        ci_val = c_i[ip]
+        for jp in range(alpha_j.shape[0]):
+            b = alpha_j[jp]
+            cj_val = c_j[jp]
+            gamma = a + b
+            mu = a * b / gamma
+            Px = (b / gamma) * Rx; Py = (b / gamma) * Ry; Pz = (b / gamma) * Rz
+            PAx, PAy, PAz = Px, Py, Pz
+            PBx, PBy, PBz = Px - Rx, Py - Ry, Pz - Rz
+            R2 = Rx * Rx + Ry * Ry + Rz * Rz
+            K0 = (torch.tensor(pi, dtype=dtype, device=dev) / gamma) ** 1.5 * torch.exp(-mu * R2)
+            Sx = _one_d_recur_torch(max_ix, max_jx, PAx, PBx, gamma, K0)
+            Sy = _one_d_recur_torch(max_iy, max_jy, PAy, PBy, gamma, torch.tensor(1.0, dtype=dtype, device=dev))
+            Sz = _one_d_recur_torch(max_iz, max_jz, PAz, PBz, gamma, torch.tensor(1.0, dtype=dtype, device=dev))
+            inv2g = 1.0 / (2.0 * gamma)
+            for ii, (lix, liy, liz) in enumerate(cart_i):
+                for jj, (ljx, ljy, ljz) in enumerate(cart_j):
+                    fx = _f1_torch(PAx, lix, ljx, inv2g, Sx)
+                    fy = _f1_torch(PAy, liy, ljy, inv2g, Sy)
+                    fz = _f1_torch(PAz, liz, ljz, inv2g, Sz)
+                    sX = Sx[lix, ljx]
+                    sY = Sy[liy, ljy]
+                    sZ = Sz[liz, ljz]
+                    gx = _g2_torch(PAx, lix, ljx, inv2g, Sx)
+                    gy = _g2_torch(PAy, liy, ljy, inv2g, Sy)
+                    gz = _g2_torch(PAz, liz, ljz, inv2g, Sz)
+                    w = ci_val * cj_val
+                    Dx = Dx + w * (fx * sY * sZ) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Dy = Dy + w * (sX * fy * sZ) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Dz = Dz + w * (sX * sY * fz) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qxx = Qxx + w * (gx * sY * sZ) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qyy = Qyy + w * (sX * gy * sZ) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qzz = Qzz + w * (sX * sY * gz) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qxy = Qxy + w * (fx * fy * sZ) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qxz = Qxz + w * (fx * fz * sY) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+                    Qyz = Qyz + w * (fy * fz * sX) * _basis_ij(nci, ncj, ii, jj, dev, dtype)
+    Ti = _metric_transform_for_shell(l_i, alpha_i, c_i)
+    Tj = _metric_transform_for_shell(l_j, alpha_j, c_j)
+    def sph(M: torch.Tensor) -> torch.Tensor:
+        return Ti @ M @ Tj.T
+    return sph(Dx), sph(Dy), sph(Dz), sph(Qxx), sph(Qxy), sph(Qxz), sph(Qyy), sph(Qyz), sph(Qzz)
+
+
+def _basis_ij(nci: int, ncj: int, ii: int, jj: int, dev, dtype) -> torch.Tensor:
+    """Return a matrix with 1.0 at (ii,jj) and 0 elsewhere (no in-place writes)."""
+    out = torch.zeros((nci, ncj), dtype=dtype, device=dev)
+    out[ii, jj] = 1.0
+    return out

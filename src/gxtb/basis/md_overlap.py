@@ -42,7 +42,7 @@ _HAVE_DXTB = False  # explicit: no dependency on external dxtb package
 # is verified for all on‑center/off‑center cases and angular momenta.
 try:
     from .md_numba import overlap_cart_block_numba as _overlap_cart_block_nb  # type: ignore
-    _HAVE_NUMBA = False  # force off to avoid silent algebra drift
+    _HAVE_NUMBA = False  # keep disabled by default until parity verified
 except Exception:
     _HAVE_NUMBA = False
 
@@ -154,13 +154,30 @@ def _metric_orthonormal_sph_transform(l: int, Scc: torch.Tensor) -> torch.Tensor
     device = Scc.device
     # Base transform (rows span the intended real‑spherical subspace).
     M0 = _spherical_transform(l, dtype, device)  # (n_sph x n_cart)
-    G = M0 @ Scc @ M0.T
-    evals, evecs = torch.linalg.eigh(G)
-    if torch.any(evals <= 0):
-        mine = float(evals.min().item())
-        raise ValueError(f"On-center metric not SPD for l={l} (min eig={mine:.3e})")
+    # Symmetrize and robustify eigen-decomposition with small ridge if needed
+    G = M0 @ (0.5 * (Scc + Scc.T)) @ M0.T
+    ridge = [0.0, 1e-14, 1e-12, 1e-10, 1e-8]
+    evals = None; evecs = None
+    for r in ridge:
+        try:
+            Greg = G if r == 0.0 else (G + r * torch.eye(G.shape[0], dtype=G.dtype, device=G.device))
+            _evals, _evecs = torch.linalg.eigh(Greg)
+            evals, evecs = _evals, _evecs
+            break
+        except Exception:
+            continue
+    if evals is None or evecs is None:
+        # Fallback to SVD-based whitening
+        try:
+            U, S, Vh = torch.linalg.svd(G, full_matrices=False)
+            ev_clamped = S.clamp_min(1e-30)
+            inv_sqrt = U @ torch.diag(ev_clamped.rsqrt()) @ U.T
+            return inv_sqrt @ M0
+        except Exception:
+            raise RuntimeError("Failed to diagonalize on-center metric for spherical transform")
     # Left‑whiten with G^{-1/2} to satisfy T Scc T^T = I exactly (within tol)
-    inv_sqrt = (evecs * evals.clamp_min(1e-30).rsqrt()) @ evecs.T
+    ev_clamped = evals.clamp_min(1e-30)
+    inv_sqrt = (evecs * ev_clamped.rsqrt()) @ evecs.T
     return inv_sqrt @ M0
 
 
@@ -198,21 +215,27 @@ def _one_d_recur(l1: int, l2: int, PA: float, PB: float, gamma: float, K: float)
     E[0,j] = PB E[0,j-1] + (j-1)/(2γ) E[0,j-2]
     E[i,j] = PA E[i-1,j] + (i-1)/(2γ) E[i-2,j] + (j)/(2γ) E[i-1,j-1]
     """
-    S = [[0.0] * (l2 + 1) for _ in range(l1 + 1)]
-    S[0][0] = K
+    # Torch implementation (CPU/GPU) faithful to the Obara–Saika 1D recurrence.
+    # eq: Hermite recurrence used in MD overlap (doc refs above). No algebra change.
+    dtype = torch.float64
+    S = torch.zeros((l1 + 1, l2 + 1), dtype=dtype)
+    S[0, 0] = K
     inv2g = 1.0 / (2.0 * gamma)
+    # First column
     for i in range(1, l1 + 1):
-        S[i][0] = PA * S[i - 1][0] + (i - 1) * inv2g * (S[i - 2][0] if i > 1 else 0.0)
+        S[i, 0] = PA * S[i - 1, 0]
+        if i > 1:
+            S[i, 0] = S[i, 0] + (i - 1) * inv2g * S[i - 2, 0]
+    # First row
     for j in range(1, l2 + 1):
-        S[0][j] = PB * S[0][j - 1] + (j - 1) * inv2g * (S[0][j - 2] if j > 1 else 0.0)
+        S[0, j] = PB * S[0, j - 1]
+        if j > 1:
+            S[0, j] = S[0, j] + (j - 1) * inv2g * S[0, j - 2]
+    # Interior
     for i in range(1, l1 + 1):
         for j in range(1, l2 + 1):
-            S[i][j] = (
-                PA * S[i - 1][j]
-                + (i - 1) * inv2g * (S[i - 2][j] if i > 1 else 0.0)
-                + j * inv2g * S[i - 1][j - 1]
-            )
-    return S
+            S[i, j] = PA * S[i - 1, j] + (i - 1) * inv2g * (S[i - 2, j] if i > 1 else 0.0) + j * inv2g * S[i - 1, j - 1]
+    return S.tolist()
 
 
 def _overlap_cart_block(li: int, lj: int, alpha_i: torch.Tensor, c_i: torch.Tensor, alpha_j: torch.Tensor, c_j: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
@@ -239,6 +262,14 @@ def _overlap_cart_block(li: int, lj: int, alpha_i: torch.Tensor, c_i: torch.Tens
     max_ix = max(ci[0] for ci in cart_i); max_jx = max(cj[0] for cj in cart_j)
     max_iy = max(ci[1] for ci in cart_i); max_jy = max(cj[1] for cj in cart_j)
     max_iz = max(ci[2] for ci in cart_i); max_jz = max(cj[2] for cj in cart_j)
+    # Precompute Cartesian index arrays for vectorized gather
+    lix_idx = torch.tensor([ci[0] for ci in cart_i], dtype=torch.long, device=alpha_i.device)
+    liy_idx = torch.tensor([ci[1] for ci in cart_i], dtype=torch.long, device=alpha_i.device)
+    liz_idx = torch.tensor([ci[2] for ci in cart_i], dtype=torch.long, device=alpha_i.device)
+    ljx_idx = torch.tensor([cj[0] for cj in cart_j], dtype=torch.long, device=alpha_i.device)
+    ljy_idx = torch.tensor([cj[1] for cj in cart_j], dtype=torch.long, device=alpha_i.device)
+    ljz_idx = torch.tensor([cj[2] for cj in cart_j], dtype=torch.long, device=alpha_i.device)
+
     for ip in range(alpha_i.shape[0]):
         a = float(alpha_i[ip].item())
         ci_val = float(c_i[ip].item())
@@ -256,9 +287,15 @@ def _overlap_cart_block(li: int, lj: int, alpha_i: torch.Tensor, c_i: torch.Tens
             Sx = _one_d_recur(max_ix, max_jx, PAx, PBx, gamma, K)
             Sy = _one_d_recur(max_iy, max_jy, PAy, PBy, gamma, 1.0)
             Sz = _one_d_recur(max_iz, max_jz, PAz, PBz, gamma, 1.0)
-            for ii,(lix,liy,liz) in enumerate(cart_i):
-                for jj,(ljx,ljy,ljz) in enumerate(cart_j):
-                    out[ii,jj] += ci_val * cj_val * Sx[lix][ljx] * Sy[liy][ljy] * Sz[liz][ljz]
+            # Convert small Python lists to tensors once per primitive pair
+            Sx_t = torch.tensor(Sx, dtype=alpha_i.dtype, device=alpha_i.device)
+            Sy_t = torch.tensor(Sy, dtype=alpha_i.dtype, device=alpha_i.device)
+            Sz_t = torch.tensor(Sz, dtype=alpha_i.dtype, device=alpha_i.device)
+            # Gather rows/cols for all (ii,jj) pairs vectorized
+            X = Sx_t.index_select(0, lix_idx).index_select(1, ljx_idx)
+            Y = Sy_t.index_select(0, liy_idx).index_select(1, ljy_idx)
+            Z = Sz_t.index_select(0, liz_idx).index_select(1, ljz_idx)
+            out = out + (ci_val * cj_val) * (X * Y * Z)
     return out
 
 

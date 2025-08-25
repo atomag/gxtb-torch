@@ -94,3 +94,71 @@ def build_moment_matrices(
             Sij = overlap_shell_pair(li, lj, alpha_i, c_i, alpha_j, c_j, R)
             S[oi : oi + ni, oj : oj + nj] = Sij
     return S, (Dx, Dy, Dz), (Qxx, Qxy, Qxz, Qyy, Qyz, Qzz)
+
+
+def build_moment_matrices_torch(
+    numbers: Tensor,
+    positions: Tensor,
+    basis,
+    *,
+    coeff_override: Optional[List[Tensor]] = None,
+) -> Tuple[Tensor, Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]:
+    """Autograd-friendly AO-level S, D, Q matrices for current geometry.
+
+    Uses torch Hermite recurrences and metric-orthonormal spherical transforms to enable
+    differentiation of AES energy with respect to nuclear positions.
+    """
+    nao = basis.nao
+    dtype = positions.dtype
+    device = positions.device
+    Dx = torch.zeros((nao, nao), dtype=dtype, device=device)
+    Dy = torch.zeros_like(Dx)
+    Dz = torch.zeros_like(Dx)
+    Qxx = torch.zeros_like(Dx)
+    Qxy = torch.zeros_like(Dx)
+    Qxz = torch.zeros_like(Dx)
+    Qyy = torch.zeros_like(Dx)
+    Qyz = torch.zeros_like(Dx)
+    Qzz = torch.zeros_like(Dx)
+    # Differentiable S using torch MD kernel
+    from ..basis.md_overlap import overlap_shell_pair_torch as _ov_sph_t
+    from ..basis.moments import moment_shell_pair_torch as _mom_sph_t
+    S = torch.zeros((nao, nao), dtype=dtype, device=device)
+    alpha_list = []
+    coeff_list = []
+    for sh in basis.shells:
+        alpha_list.append(torch.tensor([p[0] for p in sh.primitives], dtype=dtype, device=device))
+        if coeff_override is None:
+            coeff_list.append(torch.tensor([p[1] for p in sh.primitives], dtype=dtype, device=device))
+        else:
+            coeff_list.append(coeff_override[len(coeff_list)].to(device=device, dtype=dtype))
+    for i, shi in enumerate(basis.shells):
+        oi, ni = basis.ao_offsets[i], basis.ao_counts[i]
+        alpha_i = alpha_list[i]
+        c_i = coeff_list[i]
+        li = {"s": 0, "p": 1, "d": 2, "f": 3}.get(shi.l, 0)
+        Ri = positions[shi.atom_index]
+        for j, shj in enumerate(basis.shells):
+            oj, nj = basis.ao_offsets[j], basis.ao_counts[j]
+            alpha_j = alpha_list[j]
+            c_j = coeff_list[j]
+            lj = {"s": 0, "p": 1, "d": 2, "f": 3}.get(shj.l, 0)
+            Rj = positions[shj.atom_index]
+            R = Ri - Rj
+            # Moments (torch)
+            Dxi, Dyi, Dzi, Qxxi, Qxyi, Qxzi, Qyyi, Qyzi, Qzzi = _mom_sph_t(
+                li, lj, alpha_i, c_i, alpha_j, c_j, R
+            )
+            Dx[oi:oi+ni, oj:oj+nj] = Dxi
+            Dy[oi:oi+ni, oj:oj+nj] = Dyi
+            Dz[oi:oi+ni, oj:oj+nj] = Dzi
+            Qxx[oi:oi+ni, oj:oj+nj] = Qxxi
+            Qxy[oi:oi+ni, oj:oj+nj] = Qxyi
+            Qxz[oi:oi+ni, oj:oj+nj] = Qxzi
+            Qyy[oi:oi+ni, oj:oj+nj] = Qyyi
+            Qyz[oi:oi+ni, oj:oj+nj] = Qyzi
+            Qzz[oi:oi+ni, oj:oj+nj] = Qzzi
+            # Overlap (torch) for S
+            Sij = _ov_sph_t(li, lj, alpha_i, c_i, alpha_j, c_j, R)
+            S[oi:oi+ni, oj:oj+nj] = Sij
+    return S, (Dx, Dy, Dz), (Qxx, Qxy, Qxz, Qyy, Qyz, Qzz)

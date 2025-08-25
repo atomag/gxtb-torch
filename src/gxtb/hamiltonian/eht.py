@@ -51,6 +51,7 @@ def build_eht_hamiltonian(
         schema: GxTBSchema,
         r_cov: torch.Tensor | None = None,
         k_cn: float | None = None,
+        eht_params: dict | None = None,
     wolfsberg_mode: str = "arithmetic",  # "arithmetic" (Eq.64) or "geometric" (design variant)
     *,
     S_raw_override: torch.Tensor | None = None,
@@ -82,7 +83,7 @@ def build_eht_hamiltonian(
     r_cov_eff = r_cov if r_cov is not None else (cn_map['r_cov'] if cn_map else None)
     k_cn_eff = k_cn if k_cn is not None else (cn_map['k_cn'] if cn_map else None)
     eps = build_onsite(numbers, positions, basis, gparams, schema, r_cov_eff, k_cn_eff)
-    eht = map_eht_params(gparams, schema)
+    eht = eht_params if eht_params is not None else map_eht_params(gparams, schema)
     # Inject r_cov for Eq. 67 normalization in Π(R) if available
     if r_cov_eff is None and cn_map is not None:
         r_cov_eff = cn_map['r_cov']

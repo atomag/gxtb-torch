@@ -63,6 +63,7 @@ class GxTBCalculator(Calculator):
         d4_ref_dict: Optional[dict] = None,
         # Force evaluation controls (numerical differentiation)
         force_diff: str = "central",  # 'central' (2*3N evals) or 'forward' (1+3N evals)
+        force_mode: str = "numeric",   # 'numeric' or 'analytic' (analytic supported for non-PBC)
         force_eps: float = 1.0e-3,
         force_log: bool = False,
         # PBC controls (see doc/theory/25_periodic_boundary_conditions.md)
@@ -81,10 +82,21 @@ class GxTBCalculator(Calculator):
         ewald_eta: Optional[float] = None,
         ewald_r_cut: Optional[float] = None,
         ewald_g_cut: Optional[float] = None,
-        # SCF-k knobs
+        # SCF knobs (mixing and convergence)
         scf_mix: float = 0.5,
         scf_tol: float = 1e-6,
         scf_max_iter: int = 50,
+        # Mixing controls (exposed): scheme and damping parameters passed to scf()
+        scf_mixing: str = "anderson",           # 'linear' | 'anderson' | 'broyden'
+        scf_mixing_history: int = 5,             # history length for Anderson/Broyden
+        scf_beta_min: float = 0.05,              # lower bound for adaptive beta
+        scf_beta_max: float = 0.8,               # upper bound for adaptive beta
+        scf_beta_decay: float = 0.5,             # decay factor when divergence detected
+        scf_restart_on_nan: bool = True,         # restart mixing with reduced beta on NaN energy
+        scf_mix_init: float = 0.1,               # initial linear mixing for soft-start
+        scf_anderson_soft_start: bool = True,     # use simple mixing for first `history` steps
+        scf_anderson_diag_offset: float = 0.01,   # diagonal offset (ridge) for Anderson normal eqs
+        scf_scp_mode: str = "charge",            # 'charge' or 'potential' (AES)
         # Overlap SPD control for k-space orthogonalization
         s_spd_floor: float = 1e-8,
         s_psd_adapt: bool = True,
@@ -159,6 +171,23 @@ class GxTBCalculator(Calculator):
         self._scf_mix = float(scf_mix)
         self._scf_tol = float(scf_tol)
         self._scf_max_iter = int(scf_max_iter)
+        # Exposed mixing controls
+        msch = str(scf_mixing).lower()
+        if msch not in ("linear", "anderson", "broyden"):
+            raise ValueError("scf_mixing must be 'linear', 'anderson', or 'broyden'")
+        self._scf_mixing = msch
+        self._scf_mixing_history = int(scf_mixing_history)
+        self._scf_beta_min = float(scf_beta_min)
+        self._scf_beta_max = float(scf_beta_max)
+        self._scf_beta_decay = float(scf_beta_decay)
+        self._scf_restart_on_nan = bool(scf_restart_on_nan)
+        self._scf_mix_init = float(scf_mix_init)
+        self._scf_anderson_soft_start = bool(scf_anderson_soft_start)
+        self._scf_anderson_diag_offset = float(scf_anderson_diag_offset)
+        scpm = str(scf_scp_mode).lower()
+        if scpm not in ("charge", "potential"):
+            raise ValueError("scf_scp_mode must be 'charge' or 'potential'")
+        self._scf_scp_mode = scpm
         self._s_spd_floor = float(s_spd_floor)
         self._s_psd_adapt = bool(s_psd_adapt)
         self._pbc_cutoff_max = pbc_cutoff_max
@@ -171,6 +200,10 @@ class GxTBCalculator(Calculator):
         self._molden_norm = molden_norm if molden_norm in (None, 'sqrt_sii', 'inv_sqrt_sii') else None
         # Force knobs
         self._force_diff = 'forward' if str(force_diff).lower().startswith('forw') else 'central'
+        fm = str(force_mode).lower()
+        if fm not in ("numeric", "analytic"):
+            raise ValueError("force_mode must be 'numeric' or 'analytic'")
+        self._force_mode = fm
         self._force_eps = float(force_eps)
         self._force_log = bool(force_log)
         # Spin options
@@ -181,6 +214,8 @@ class GxTBCalculator(Calculator):
         self._last_scf_q: Optional[torch.Tensor] = None
         self._last_scf_numbers: Optional[torch.Tensor] = None
         self._force_eval_mode: bool = False
+        # SCF call counter for logging cycles
+        self._scf_call_counter: int = 0
 
     def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):  # type: ignore
         if hasattr(super(), "calculate"):
@@ -691,9 +726,9 @@ class GxTBCalculator(Calculator):
             from .params.schema import map_fourth_order_params
             fourth_params = {'gamma4': float(map_fourth_order_params(self._p_gxtb, self._schema))}
 
-        # Warm-start initial charges for SCF during force evaluations
+        # Warm-start initial charges for SCF: prefer last SCF q if available and numbers unchanged
         init_q = charges
-        if getattr(self, '_force_eval_mode', False) and getattr(self, '_last_scf_q', None) is not None and getattr(self, '_last_scf_numbers', None) is not None:
+        if getattr(self, '_last_scf_q', None) is not None and getattr(self, '_last_scf_numbers', None) is not None:
             try:
                 if torch.equal(self._last_scf_numbers.to(device=self.device), numbers.to(device=self.device)) and self._last_scf_q.shape == charges.shape:
                     init_q = self._last_scf_q.to(device=self.device, dtype=positions.dtype)
@@ -701,6 +736,8 @@ class GxTBCalculator(Calculator):
                 init_q = charges
 
         try:
+            # Increment SCF cycle counter for logging
+            self._scf_call_counter += 1
             res = scf(
                 numbers,
                 positions,
@@ -712,6 +749,19 @@ class GxTBCalculator(Calculator):
                 nelec=nelec,
                 max_iter=self._scf_max_iter,
                 tol=self._scf_tol,
+                mix=self._scf_mix,
+                mixing={
+                    'scheme': self._scf_mixing,
+                    'beta': self._scf_mix,
+                    'history': self._scf_mixing_history,
+                    'beta_init': self._scf_mix_init,
+                    'anderson_soft_start': self._scf_anderson_soft_start,
+                    'anderson_diag_offset': self._scf_anderson_diag_offset,
+                    'beta_min': self._scf_beta_min,
+                    'beta_max': self._scf_beta_max,
+                    'beta_decay': self._scf_beta_decay,
+                    'restart_on_nan': self._scf_restart_on_nan,
+                },
                 second_order=self._enable_second_order,
                 so_params=so_params if so_params is not None else {},
                 third_order=self._enable_third_order,
@@ -727,6 +777,8 @@ class GxTBCalculator(Calculator):
                 uhf=self._uhf,
                 nelec_alpha=self._nelec_alpha,
                 nelec_beta=self._nelec_beta,
+                scp_mode=self._scf_scp_mode,
+                log_cycle=self._scf_call_counter,
             )
         except Exception as exc:
             # Shell-resolved second-order may fail for elements whose valence includes shells
@@ -738,6 +790,7 @@ class GxTBCalculator(Calculator):
                 'eta': hub['gamma'],
                 'r_cov': cn_map['r_cov'],
             }
+            self._scf_call_counter += 1
             res = scf(
                 numbers,
                 positions,
@@ -749,6 +802,19 @@ class GxTBCalculator(Calculator):
                 nelec=nelec,
                 max_iter=self._scf_max_iter,
                 tol=self._scf_tol,
+                 mix=self._scf_mix,
+                 mixing={
+                    'scheme': self._scf_mixing,
+                    'beta': self._scf_mix,
+                    'history': self._scf_mixing_history,
+                    'beta_init': self._scf_mix_init,
+                    'anderson_soft_start': self._scf_anderson_soft_start,
+                    'anderson_diag_offset': self._scf_anderson_diag_offset,
+                    'beta_min': self._scf_beta_min,
+                    'beta_max': self._scf_beta_max,
+                    'beta_decay': self._scf_beta_decay,
+                    'restart_on_nan': self._scf_restart_on_nan,
+                 },
                 second_order=self._enable_second_order,
                 so_params=so_atomic,
                 third_order=self._enable_third_order,
@@ -764,6 +830,8 @@ class GxTBCalculator(Calculator):
                 uhf=self._uhf,
                 nelec_alpha=self._nelec_alpha,
                 nelec_beta=self._nelec_beta,
+                scp_mode=self._scf_scp_mode,
+                log_cycle=self._scf_call_counter,
             )
         e_el = res.E_elec if res.E_elec is not None else torch.einsum('ij,ji->', res.P, core['H0'])
         e_total = (e_incr + e_rep + e_el)
@@ -887,16 +955,222 @@ class GxTBCalculator(Calculator):
             )
         
     def get_forces(self, atoms):  # type: ignore
-        """Numerical forces via finite differences on energy (eV/Å).
+        """Return forces (eV/Å): analytic (non-PBC) or numeric via finite differences.
 
-        Supports central (default) and forward differences. Forward reduces
-        energy evaluations from 2*3N to 1+3N per call (approximate gradient).
+        - Analytic mode aggregates per-term gradients implemented in gxtb.grad.nuclear (doc/theory/6).
+          Only supported for non-PBC geometries. Raises if required parameters are missing.
+        - Numeric mode supports central (default) and forward differences.
         """
         # Determine step and scheme
         try:
             pbc_flags = atoms.get_pbc()
         except Exception:
             pbc_flags = (False, False, False)
+        # Analytic forces path (non-PBC only)
+        if not any(bool(x) for x in tuple(pbc_flags)) and getattr(self, "_force_mode", "numeric") == "analytic":
+            # Ensure latest SCF state matches current geometry
+            _ = self.get_potential_energy(atoms)
+            numbers = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.int64, device=self.device)
+            positions = torch.tensor(atoms.get_positions(), dtype=torch.get_default_dtype(), device=self.device)
+            basis = build_atom_basis(numbers, self._p_basis)
+            # Build repulsion params (for gradient) and EEQ charges + derivative
+            from .params.schema import map_repulsion_params, map_cn_params
+            from .classical.repulsion import RepulsionParams as _RParams
+            rp = map_repulsion_params(self._p_gxtb, self._schema)
+            cnm = map_cn_params(self._p_gxtb, self._schema)
+            rep_params = _RParams(
+                z_eff0=rp['z_eff0'].to(device=self.device, dtype=positions.dtype),
+                alpha0=rp['alpha0'].to(device=self.device, dtype=positions.dtype),
+                kq=rp['kq'].to(device=self.device, dtype=positions.dtype),
+                kq2=rp['kq2'].to(device=self.device, dtype=positions.dtype),
+                kcn_elem=rp['kcn'].to(device=self.device, dtype=positions.dtype),
+                r0=rp['r0'].to(device=self.device, dtype=positions.dtype),
+                kpen1_hhe=float(rp['kpen1_hhe']),
+                kpen1_rest=float(rp['kpen1_rest']),
+                kpen2=float(rp['kpen2']),
+                kpen3=float(rp['kpen3']),
+                kpen4=float(rp['kpen4']),
+                kexp=float(rp['kexp']),
+                r_cov=cnm['r_cov'].to(device=self.device, dtype=positions.dtype),
+                k_cn=float(cnm['k_cn']),
+            )
+            # EEQ charges and derivative for repulsion Eq. 58
+            from .charges.eeq import compute_eeq_charges, compute_eeq_charge_derivative
+            eeq_map = getattr(self._schema, 'eeq', None)
+            if eeq_map is None:
+                raise ValueError("Analytic forces require [eeq] schema mapping for charges/derivatives")
+            mapping = {k: int(v) for k, v in eeq_map.items()}
+            q_eeq = compute_eeq_charges(numbers, positions, self._p_eeq, 0.0, mapping=mapping, device=self.device, dtype=positions.dtype)
+            dq_dpos = compute_eeq_charge_derivative(numbers, positions, self._p_eeq, 0.0, mapping=mapping, device=self.device, dtype=positions.dtype)
+            # SCF to get density and charges (reuse energy path configuration)
+            core = build_eht_core(numbers, positions, basis, self._p_gxtb, self._schema)
+            builder = make_core_builder(basis, self._p_gxtb, self._schema)
+            # Hubbard params & second/third/fourth settings as in energy path
+            hub = map_hubbard_params(self._p_gxtb, self._schema)
+            # Electron count
+            elem_to_shells: Dict[int, set[str]] = {}
+            for sh in basis.shells:
+                elem_to_shells.setdefault(int(sh.element), set()).add(sh.l)
+            nelec = 0
+            for z in numbers.tolist():
+                val = _electron_configuration_valence_counts(int(z))
+                present = elem_to_shells.get(int(z), set())
+                nelec += int(round(sum(v for l, v in val.items() if l in present)))
+            # Second/third/fourth and AES params mirroring calculate()
+            so_params = None
+            shell_params_for_orders = None
+            try:
+                if self._enable_second_order or self._enable_third_order:
+                    from .hamiltonian.second_order_tb import build_shell_second_order_params as _build_sp
+                    gvec = hub['gamma']
+                    shell_params_for_orders = _build_sp(int(numbers.max().item()), gvec)
+                if self._enable_second_order and shell_params_for_orders is not None:
+                    from .cn import coordination_number
+                    cn = coordination_number(positions, numbers, cnm['r_cov'].to(device=self.device, dtype=positions.dtype), float(cnm['k_cn']))
+                    so_params = {'shell_params': shell_params_for_orders, 'cn': cn}
+            except Exception:
+                so_params = None
+            aes_params_dict = None
+            if self._enable_aes:
+                try:
+                    from .hamiltonian.aes import AESParams as _AESParams
+                    from .params.schema import map_aes_global, map_aes_element
+                    aesg = map_aes_global(self._p_gxtb, self._schema)
+                    aese = map_aes_element(self._p_gxtb, self._schema)
+                    aes_params_dict = {
+                        'params': _AESParams(
+                            dmp3=float(aesg['dmp3']),
+                            dmp5=float(aesg['dmp5']),
+                            mprad=aese['mprad'].to(device=self.device, dtype=positions.dtype),
+                            mpvcn=aese['mpvcn'].to(device=self.device, dtype=positions.dtype),
+                            dmp7=float(aesg['dmp7']) if 'dmp7' in aesg else None,
+                            dmp9=float(aesg['dmp9']) if 'dmp9' in aesg else None,
+                        ),
+                        'r_cov': cnm['r_cov'].to(device=self.device, dtype=positions.dtype),
+                        'k_cn': float(cnm['k_cn']),
+                        'si_rules': getattr(self._schema, 'aes_rules', None),
+                    }
+                except Exception:
+                    aes_params_dict = None
+            # Third/fourth order params
+            third_shell_params = None
+            third_params = None
+            if self._enable_third_order:
+                if shell_params_for_orders is None:
+                    from .hamiltonian.second_order_tb import build_shell_second_order_params as _build_sp
+                    shell_params_for_orders = _build_sp(int(numbers.max().item()), hub['gamma'])
+                if shell_params_for_orders is not None:
+                    third_shell_params = {'shell_params': shell_params_for_orders, 'cn': cn}
+                    from .params.schema import map_third_order_params
+                    tp = map_third_order_params(self._p_gxtb, self._schema)
+                    third_params = {
+                        'gamma3_elem': tp['gamma3_elem'].to(device=self.device, dtype=positions.dtype),
+                        'kGamma': tp['kGamma'].to(device=self.device, dtype=positions.dtype),
+                        'k3': float(tp['k3']),
+                        'k3x': float(tp['k3x']),
+                    }
+            fourth_params = None
+            if self._enable_fourth_order:
+                from .params.schema import map_fourth_order_params
+                fourth_params = {'gamma4': float(map_fourth_order_params(self._p_gxtb, self._schema))}
+
+            # Run SCF to get P and q (with fallback to atomic second-order like calculate())
+            try:
+                self._scf_call_counter += 1
+                res = scf(
+                    numbers, positions, basis, builder, core['S'],
+                    hubbard=hub, ao_atoms=core['ao_atoms'], nelec=nelec,
+                    max_iter=self._scf_max_iter, tol=self._scf_tol, mix=self._scf_mix,
+                    mixing={
+                        'scheme': self._scf_mixing,
+                        'beta': self._scf_mix,
+                        'history': self._scf_mixing_history,
+                        'beta_init': self._scf_mix_init,
+                        'anderson_soft_start': self._scf_anderson_soft_start,
+                        'anderson_diag_offset': self._scf_anderson_diag_offset,
+                        'beta_min': self._scf_beta_min,
+                        'beta_max': self._scf_beta_max,
+                        'beta_decay': self._scf_beta_decay,
+                        'restart_on_nan': self._scf_restart_on_nan,
+                    },
+                    second_order=self._enable_second_order, so_params=(so_params if so_params is not None else {}),
+                    third_order=self._enable_third_order, third_shell_params=third_shell_params, third_params=third_params,
+                    fourth_order=self._enable_fourth_order, fourth_params=fourth_params,
+                    eeq_charges=q_eeq,
+                    scp_mode=self._scf_scp_mode,
+                    log_cycle=self._scf_call_counter,
+                )
+            except Exception:
+                # Fallback: atomic second-order only
+                so_atomic = {'eta': hub['gamma'], 'r_cov': cnm['r_cov']}
+                self._scf_call_counter += 1
+                res = scf(
+                    numbers, positions, basis, builder, core['S'],
+                    hubbard=hub, ao_atoms=core['ao_atoms'], nelec=nelec,
+                    max_iter=self._scf_max_iter, tol=self._scf_tol, mix=self._scf_mix,
+                    mixing={
+                        'scheme': self._scf_mixing,
+                        'beta': self._scf_mix,
+                        'history': self._scf_mixing_history,
+                        'beta_init': self._scf_mix_init,
+                        'anderson_soft_start': self._scf_anderson_soft_start,
+                        'anderson_diag_offset': self._scf_anderson_diag_offset,
+                        'beta_min': self._scf_beta_min,
+                        'beta_max': self._scf_beta_max,
+                        'beta_decay': self._scf_beta_decay,
+                        'restart_on_nan': self._scf_restart_on_nan,
+                    },
+                    second_order=self._enable_second_order, so_params=so_atomic,
+                    third_order=False, fourth_order=self._enable_fourth_order, fourth_params=fourth_params,
+                    eeq_charges=q_eeq,
+                    scp_mode=self._scf_scp_mode,
+                    log_cycle=self._scf_call_counter,
+                )
+            P = res.P
+            # Dispersion parameters (optional)
+            disp_params = None
+            if self._enable_dispersion:
+                from .classical.dispersion import load_d4_method
+                method = load_d4_method(str(Path("parameters") / "dftd4parameters.toml"), variant=self._d4_variant, functional=self._d4_functional)
+                ref_static = self._d4_ref_static
+                if ref_static is None:
+                    ref_path = self._d4_reference_path or str(Path("parameters") / "d4_reference.toml")
+                    from .params.loader import load_d4_reference_toml
+                    ref_static = load_d4_reference_toml(ref_path, device=self.device, dtype=positions.dtype)
+                    self._d4_ref_static = ref_static
+                ref = dict(ref_static)
+                # Attach CN (molecular)
+                from .cn import coordination_number
+                ref['cn'] = coordination_number(positions, numbers, cnm['r_cov'].to(device=self.device, dtype=positions.dtype), float(cnm['k_cn']))
+                disp_params = {'method': method, 'ref': ref, 'q': q_eeq}
+            # Total gradient aggregation
+            from .grad.nuclear import total_gradient as _totgrad
+            g = _totgrad(
+                numbers, positions, basis, self._p_gxtb, self._schema,
+                P=P,
+                include_eht_stepA=True,
+                include_dynamic_overlap_cn=bool(self._enable_dynamic_overlap),
+                q_scf=(res.q if hasattr(res, 'q') and res.q is not None else None),
+                q_eeqbc=q_eeq,
+                include_second_order=bool(self._enable_second_order),
+                # atomic isotropic second-order for gradients (shell-resolved gradient not yet wired)
+                so_params={'eta': hub['gamma'], 'r_cov': cnm['r_cov']},
+                q=(res.q if hasattr(res, 'q') else None),
+                q_ref=(res.q_ref if hasattr(res, 'q_ref') else None),
+                include_aes=bool(self._enable_aes and (aes_params_dict is not None)),
+                aes_params=(aes_params_dict['params'] if aes_params_dict is not None else None),
+                aes_r_cov=(aes_params_dict['r_cov'] if aes_params_dict is not None else None),
+                aes_k_cn=(aes_params_dict['k_cn'] if aes_params_dict is not None else None),
+                include_repulsion=True,
+                repulsion_params=rep_params,
+                eeq=self._p_eeq,
+                repulsion_dq_dpos=dq_dpos,
+                include_dispersion=bool(self._enable_dispersion),
+                dispersion_params=disp_params,
+            )
+            # Convert to forces (eV/Å)
+            f = (-g * EH2EV).detach().cpu().numpy()
+            return f
         # Base epsilon on PBC smoothness rule; allow override via self._force_eps
         base_eps = 3.0e-4 if any(bool(x) for x in tuple(pbc_flags)) else 1.0e-3
         eps = float(getattr(self, "_force_eps", base_eps))
@@ -908,6 +1182,11 @@ class GxTBCalculator(Calculator):
         # Enable warm-start during force evaluation
         prev_force_flag = getattr(self, '_force_eval_mode', False)
         self._force_eval_mode = True
+        # Optionally suppress SCF INFO logs during finite differences
+        scf_logger = logging.getLogger('gxtb.scf')
+        prev_level = scf_logger.level
+        if not getattr(self, '_force_log', False):
+            scf_logger.setLevel(logging.WARNING)
         # Force accumulation
         f = []
         pos = atoms.get_positions()
@@ -933,8 +1212,11 @@ class GxTBCalculator(Calculator):
                     f_comp[k] = - (ep - e0) / eps
             f.append(f_comp)
         atoms.set_positions(pos)
-        # Restore warm-start and SPD adaptation flags
+        # Restore warm-start and SPD adaptation flags and logger level
         self._force_eval_mode = prev_force_flag
-        # Restore adaptation flag
         self._s_psd_adapt = orig_adapt
+        try:
+            scf_logger.setLevel(prev_level)
+        except Exception:
+            pass
         return torch.tensor(f, dtype=torch.get_default_dtype()).cpu().numpy()
